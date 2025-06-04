@@ -103,6 +103,9 @@ mod msg;
 mod peekable_mpsc;
 mod seq;
 pub mod transport;
+pub mod unordered_cfg;
+pub mod unordered_msg;
+pub mod unordered_task;
 
 #[cfg(feature = "dump")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dump")))]
@@ -123,3 +126,6 @@ pub use cfg::Cfg;
 pub use connect::{connect, Incoming, Listener, Outgoing, Server};
 pub use control::{Control, Link};
 pub use transport::{Acceptor, Connector};
+pub use unordered_cfg::{LoadBalanceStrategy, UnorderedCfg};
+pub use unordered_msg::UnorderedLinkMsg;
+pub use unordered_task::{UnorderedAggTask, UnorderedAggHandle, UnorderedAggStats, UnorderedControlMsg, UnorderedLinkState, UnorderedLinkTransport};

@@ -23,6 +23,7 @@ aggligator = { version = "0.9.5", path = "../aggligator", features = ["dump"] }
 aggligator-monitor = { version = "0.9.5", path = "../aggligator-monitor" }
 aggligator-transport-bluer = { version = "0.1.0", path = "../aggligator-transport-bluer", optional = true }
 aggligator-transport-tcp = { version = "0.2.0", path = "../aggligator-transport-tcp" }
+aggligator-transport-udp = { version = "0.1.0", path = "../aggligator-transport-udp" }
 aggligator-transport-usb = { version = "0.3.0", path = "../aggligator-transport-usb", optional = true }
 aggligator-transport-websocket = { version = "0.4.0", path = "../aggligator-transport-websocket" }
 aggligator-wrapper-tls = { version = "0.2.0", path = "../aggligator-wrapper-tls" }
