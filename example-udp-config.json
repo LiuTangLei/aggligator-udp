@@ -1,0 +1,9 @@
+{
+  "load_balance": "WeightedByBandwidth",
+  "target_queue_len": 32,
+  "heartbeat_interval_ms": 5000,
+  "link_timeout_ms": 30000,
+  "max_in_flight": 256,
+  "enable_health_check": true,
+  "bandwidth_estimation_window_ms": 10000
+}

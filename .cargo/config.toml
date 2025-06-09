@@ -18,3 +18,9 @@ runner = "wasmtime -S threads -S inherit-env"
 # for WASI on the web (`js` feature enabled):
 # runner = "wasm-bindgen-test-runner"
 # rustflags = ["-Z", "wasi-exec-model=reactor"]
+
+[target.x86_64-unknown-linux-gnu]
+linker = "x86_64-linux-gnu-gcc"
+
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"

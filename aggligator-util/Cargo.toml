@@ -46,6 +46,8 @@ axum-server = "0.7"
 clap = { version = "4", features = ["derive"] }
 clap_mangen = "0.2"
 clap-markdown = "0.1"
+crc32fast = "1.4"
+dashmap = "6.1"
 gethostname = "1"
 network-interface = "2"
 rustls = "0.23"
@@ -58,6 +60,9 @@ name = "agg-speed"
 
 [[bin]]
 name = "agg-tunnel"
+
+[[bin]]
+name = "agg-udp"
 
 [[bin]]
 name = "raw-speed"

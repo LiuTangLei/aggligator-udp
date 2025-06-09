@@ -5,24 +5,32 @@
 //! over UDP connections.
 
 use std::{
+    collections::HashMap,
     fmt,
     io,
     net::SocketAddr,
-    sync::{Arc, atomic::{AtomicBool, Ordering}},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
+
 use bytes::{Bytes, BytesMut};
 use tokio::{
     net::UdpSocket,
     sync::{mpsc, RwLock},
-    time,
+    task::AbortHandle,
+    time::{self, sleep},
 };
 use tracing::{debug, error, info, warn};
 
 use aggligator::{
     id::LinkId,
-    unordered_task::{UnorderedLinkTransport, UnorderedControlMsg, UnorderedAggTask},
+    UnorderedLinkTransport,
+    unordered_task::{UnorderedControlMsg, UnorderedAggTask, ReceivedData},
     unordered_cfg::UnorderedCfg,
+    unordered_msg::UnorderedLinkMsg,
 };
 
 /// UDP transport implementation for unordered aggregation
@@ -187,15 +195,72 @@ impl UdpTransport {
 
 #[async_trait::async_trait]
 impl UnorderedLinkTransport for UdpTransport {
-    async fn send(&self, data: &[u8]) -> Result<usize, io::Error> {
+    async fn send_raw(&self, data: &[u8]) -> Result<usize, io::Error> {
         if self.remote_addr.port() == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "UDP transport not connected to a remote address"
             ));
         }
+
+        // If socket is connected, use send(). Otherwise, use send_to().
+        // On tokio, after connect(), send_to() will error on macOS.
+        let local_addr = self.socket.local_addr();
+        let peer_addr = self.socket.peer_addr();
+        match (local_addr, peer_addr) {
+            (Ok(_), Ok(_)) => {
+                // Connected socket, use send()
+                let result = time::timeout(self.send_timeout, self.socket.send(data)).await;
+                match result {
+                    Ok(Ok(bytes_sent)) => {
+                        *self.last_send_time.write().await = Instant::now();
+                        Ok(bytes_sent)
+                    }
+                    Ok(Err(e)) => {
+                        error!("Failed to send UDP data (connected): {}", e);
+                        Err(e)
+                    }
+                    Err(_) => {
+                        error!("UDP send (connected) timed out after {:?}", self.send_timeout);
+                        Err(io::Error::new(io::ErrorKind::TimedOut, "UDP send timeout"))
+                    }
+                }
+            }
+            _ => {
+                // Not connected, fallback to send_to
+                self.send_to(data, self.remote_addr).await
+            }
+        }
+    }
+
+    /// Send data with full session context (implements multi-link aggregation encapsulation)
+    async fn send_with_session(
+        &self,
+        data: &[u8],
+        link_id: LinkId,
+        session_id: u64,
+        original_client: Option<std::net::SocketAddr>,
+    ) -> Result<usize, std::io::Error> {
+        // Create wrapped message for multi-link aggregation
+        let msg = UnorderedLinkMsg::Data {
+            link_id,
+            session_id,
+            original_client,
+            payload: data.to_vec(),
+        };
         
-        self.send_to(data, self.remote_addr).await
+        // Serialize message
+        let mut buf = Vec::new();
+        msg.write(&mut buf).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, 
+                               format!("Failed to serialize UnorderedLinkMsg::Data: {}", e))
+        })?;
+        
+        debug!("UDP transport sending {} bytes wrapped in UnorderedLinkMsg::Data (session: {}, link: {})", 
+               data.len(), session_id, link_id);
+        
+        // Send serialized message through raw UDP
+        self.send_raw(&buf).await
     }
 
     fn remote_addr(&self) -> String {
@@ -213,17 +278,21 @@ impl fmt::Display for UdpTransport {
     }
 }
 
-/// UDP aggregation manager for multiple links
+/// UDP aggregation manager for multiple links with proper task management
 pub struct UdpAggregationManager {
     /// Control channel sender
     control_sender: mpsc::UnboundedSender<UnorderedControlMsg>,
+    /// Channel for receiving data from remote
+    rx_receiver: Arc<RwLock<Option<mpsc::UnboundedReceiver<ReceivedData>>>>,
+    /// Track running tasks for proper cleanup
+    link_tasks: Arc<RwLock<HashMap<LinkId, (AbortHandle, mpsc::UnboundedSender<()>)>>>,
 }
 
 impl UdpAggregationManager {
     /// Create a new UDP aggregation manager
     pub async fn new(config: UnorderedCfg) -> io::Result<Self> {
         let (control_sender, control_receiver) = mpsc::unbounded_channel();
-        let (rx_sender, _rx_receiver) = mpsc::unbounded_channel();
+        let (rx_sender, rx_receiver) = mpsc::unbounded_channel();
         
         // Create the aggregation task
         let agg_task = UnorderedAggTask::new(config, rx_sender, control_sender.clone());
@@ -237,28 +306,158 @@ impl UdpAggregationManager {
         
         Ok(Self {
             control_sender,
+            rx_receiver: Arc::new(RwLock::new(Some(rx_receiver))),
+            link_tasks: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
-    /// Add a UDP transport as a new link
+    /// Add a UDP transport as a new link and start receiving data from it
     pub async fn add_udp_link(&self, link_id: LinkId, transport: UdpTransport) -> io::Result<()> {
         let transport_arc = Arc::new(transport);
         
+        // Start a receiver task for this transport
+        let socket = transport_arc.socket();
+        let control_sender = self.control_sender.clone();
+        let is_connected = socket.peer_addr().is_ok();
+        
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65536];
+            loop {
+                let receive_result = if is_connected {
+                    // For connected sockets, use recv()
+                    socket.recv(&mut buf).await.map(|len| (len, socket.peer_addr().unwrap()))
+                } else {
+                    // For unconnected sockets, use recv_from()
+                    socket.recv_from(&mut buf).await
+                };
+
+                match receive_result {
+                    Ok((len, _from)) => {
+                        let data = buf[..len].to_vec();
+                        debug!("Received {} bytes on link {}", len, link_id);
+                        
+                        // Try to parse as UnorderedLinkMsg::Data, fallback to raw data
+                        let receive_msg = match UnorderedLinkMsg::read(&mut &data[..]) {
+                            Ok(UnorderedLinkMsg::Data { link_id: msg_link_id, session_id, original_client, payload }) => {
+                                debug!("Received wrapped data: link_id={}, session_id={}, payload_len={}", 
+                                       msg_link_id, session_id, payload.len());
+                                // Use session information if available
+                                if session_id != 0 || original_client.is_some() {
+                                    UnorderedControlMsg::ReceiveDataWithSession {
+                                        data: payload,
+                                        link_id: msg_link_id,
+                                        session_id,
+                                        original_client,
+                                    }
+                                } else {
+                                    UnorderedControlMsg::ReceiveData {
+                                        data: payload,
+                                        link_id: msg_link_id,
+                                    }
+                                }
+                            }
+                            Ok(_other_msg) => {
+                                debug!("Received non-data message, ignoring");
+                                continue; // Skip non-data messages
+                            }
+                            Err(_) => {
+                                // Failed to parse as wrapped message, treat as raw data
+                                debug!("Failed to parse as wrapped message, treating as raw data");
+                                UnorderedControlMsg::ReceiveData {
+                                    data,
+                                    link_id,
+                                }
+                            }
+                        };
+                        
+                        if control_sender.send(receive_msg).is_err() {
+                            error!("Failed to forward received data from link {}", link_id);
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        error!("Error receiving data on link {}: {}", link_id, e);
+                        // Could implement reconnection logic here
+                        sleep(Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        });
+        
         let add_msg = UnorderedControlMsg::AddLink {
             link_id,
-            transport: transport_arc,
+            transport: transport_arc.clone(),
         };
         
         self.control_sender.send(add_msg).map_err(|_| {
             io::Error::new(io::ErrorKind::BrokenPipe, "Aggregation task closed")
         })?;
         
+        // Create a shutdown channel for this link
+        let (health_shutdown_tx, mut health_shutdown_rx) = mpsc::unbounded_channel::<()>();
+        
+        // Track the task for this link
+        let task_handle = tokio::task::spawn({
+            async move {
+                // Keep the task alive while the link is active
+                loop {
+                    tokio::select! {
+                        _ = health_shutdown_rx.recv() => {
+                            debug!("Health check task for link {} shutting down", link_id);
+                            break;
+                        }
+                        _ = sleep(Duration::from_secs(60)) => {
+                            // Continue health check loop
+                        }
+                    }
+                }
+            }
+        });
+        
+        let abort_handle = task_handle.abort_handle();
+        self.link_tasks.write().await.insert(link_id, (abort_handle, health_shutdown_tx));
+        
         info!("Added UDP link {} to aggregation", link_id);
         Ok(())
     }
 
+    /// Take the receiver for incoming data
+    pub async fn take_receiver(&self) -> Option<mpsc::UnboundedReceiver<ReceivedData>> {
+        self.rx_receiver.write().await.take()
+    }
+
+    /// Start receiving data from the aggregation and forward to a callback
+    pub async fn start_receiving<F>(&self, mut callback: F) -> io::Result<()>
+    where
+        F: FnMut(Vec<u8>, LinkId) + Send + 'static,
+    {
+        if let Some(mut receiver) = self.take_receiver().await {
+            tokio::spawn(async move {
+                while let Some(received_data) = receiver.recv().await {
+                    debug!("Received {} bytes from aggregation on link {}", received_data.data.len(), received_data.link_id);
+                    callback(received_data.data, received_data.link_id);
+                }
+                debug!("Aggregation receiver task finished");
+            });
+        }
+        Ok(())
+    }
+
+    /// Get a receiver for manually handling received data
+    pub async fn get_receiver(&self) -> Option<mpsc::UnboundedReceiver<ReceivedData>> {
+        self.take_receiver().await
+    }
+
     /// Remove a link from the aggregation
     pub async fn remove_link(&self, link_id: LinkId) -> io::Result<()> {
+        // Stop and remove the task for this link
+        if let Some((abort_handle, health_shutdown_tx)) = self.link_tasks.write().await.remove(&link_id) {
+            // First try graceful shutdown
+            let _ = health_shutdown_tx.send(());
+            // Then abort if needed
+            abort_handle.abort();
+        }
+        
         let remove_msg = UnorderedControlMsg::RemoveLink { link_id };
         
         self.control_sender.send(remove_msg).map_err(|_| {
@@ -282,9 +481,100 @@ impl UdpAggregationManager {
             io::Error::new(io::ErrorKind::BrokenPipe, "Aggregation task closed")
         })?;
         
-        respond_rx.await.map_err(|_| {
+        let result = respond_rx.await.map_err(|_| {
             io::Error::new(io::ErrorKind::BrokenPipe, "Failed to receive response")
-        })
+        })?;
+        
+        // Convert UnorderedAggResult<SendResult> to io::Result<usize>
+        match result {
+            Ok(send_result) => Ok(send_result.bytes_sent),
+            Err(agg_error) => {
+                // Convert UnorderedAggError to io::Error
+                let io_error = match agg_error {
+                    aggligator::unordered_task::UnorderedAggError::NoLinksAvailable => {
+                        io::Error::new(io::ErrorKind::NotConnected, "No links available")
+                    }
+                    aggligator::unordered_task::UnorderedAggError::NoHealthyLinks { .. } => {
+                        io::Error::new(io::ErrorKind::NotConnected, "No healthy links available")
+                    }
+                    aggligator::unordered_task::UnorderedAggError::LinkNotFound { .. } => {
+                        io::Error::new(io::ErrorKind::NotFound, "Link not found")
+                    }
+                    aggligator::unordered_task::UnorderedAggError::LinkUnhealthy { .. } => {
+                        io::Error::new(io::ErrorKind::NotConnected, "Link unhealthy")
+                    }
+                    aggligator::unordered_task::UnorderedAggError::NetworkError { source, .. } => source,
+                    aggligator::unordered_task::UnorderedAggError::ChannelClosed { .. } => {
+                        io::Error::new(io::ErrorKind::BrokenPipe, "Control channel closed")
+                    }
+                    aggligator::unordered_task::UnorderedAggError::TimeoutOrRecvError { .. } => {
+                        io::Error::new(io::ErrorKind::TimedOut, "Operation timed out")
+                    }
+                    aggligator::unordered_task::UnorderedAggError::Internal { context, .. } => {
+                        io::Error::new(io::ErrorKind::Other, format!("Internal error: {}", context))
+                    }
+                };
+                Err(io_error)
+            }
+        }
+    }
+
+    /// Send data through the aggregation with session information for multi-link affinity
+    pub async fn send_data_with_session(
+        &self, 
+        data: Vec<u8>, 
+        session_id: u64, 
+        original_client: Option<std::net::SocketAddr>
+    ) -> io::Result<aggligator::unordered_task::SendResult> {
+        let (respond_tx, respond_rx) = tokio::sync::oneshot::channel();
+        
+        let send_msg = UnorderedControlMsg::SendDataWithSession {
+            data,
+            session_id,
+            original_client,
+            respond_to: respond_tx,
+        };
+        
+        self.control_sender.send(send_msg).map_err(|_| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "Aggregation task closed")
+        })?;
+        
+        let result = respond_rx.await.map_err(|_| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "Failed to receive response")
+        })?;
+        
+        // Convert UnorderedAggResult<SendResult> to io::Result<SendResult>
+        match result {
+            Ok(send_result) => Ok(send_result),
+            Err(agg_error) => {
+                // Convert UnorderedAggError to io::Error
+                let io_error = match agg_error {
+                    aggligator::unordered_task::UnorderedAggError::NoLinksAvailable => {
+                        io::Error::new(io::ErrorKind::NotConnected, "No links available")
+                    }
+                    aggligator::unordered_task::UnorderedAggError::NoHealthyLinks { .. } => {
+                        io::Error::new(io::ErrorKind::NotConnected, "No healthy links available")
+                    }
+                    aggligator::unordered_task::UnorderedAggError::LinkNotFound { .. } => {
+                        io::Error::new(io::ErrorKind::NotFound, "Link not found")
+                    }
+                    aggligator::unordered_task::UnorderedAggError::LinkUnhealthy { .. } => {
+                        io::Error::new(io::ErrorKind::NotConnected, "Link unhealthy")
+                    }
+                    aggligator::unordered_task::UnorderedAggError::NetworkError { source, .. } => source,
+                    aggligator::unordered_task::UnorderedAggError::ChannelClosed { .. } => {
+                        io::Error::new(io::ErrorKind::BrokenPipe, "Control channel closed")
+                    }
+                    aggligator::unordered_task::UnorderedAggError::TimeoutOrRecvError { .. } => {
+                        io::Error::new(io::ErrorKind::TimedOut, "Operation timed out")
+                    }
+                    aggligator::unordered_task::UnorderedAggError::Internal { context, .. } => {
+                        io::Error::new(io::ErrorKind::Other, format!("Internal error: {}", context))
+                    }
+                };
+                Err(io_error)
+            }
+        }
     }
 
     /// Get aggregation statistics

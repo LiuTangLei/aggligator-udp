@@ -1,0 +1,9 @@
+{
+  "load_balance": "weighted",
+  "send_queue": 512,
+  "recv_queue": 512,
+  "heartbeat_interval_ms": 200,
+  "link_timeout_ms": 1000,
+  "max_packet_size": 8192,
+  "connect_queue": 32
+}

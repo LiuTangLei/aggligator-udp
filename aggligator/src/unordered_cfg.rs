@@ -10,9 +10,15 @@ use std::{num::NonZeroUsize, time::Duration};
 
 /// Load balancing strategy for unordered aggregation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "dump", derive(serde::Serialize, serde::Deserialize))]
 pub enum LoadBalanceStrategy {
     /// Round-robin distribution across all active links.
+    /// Uses session affinity - same session always uses same link.
     RoundRobin,
+    /// Packet-level round-robin without session affinity.
+    /// Each packet is distributed to links in round-robin fashion,
+    /// allowing single UDP flows to use multiple links for bandwidth aggregation.
+    PacketRoundRobin,
     /// Weighted distribution based on link bandwidth.
     WeightedByBandwidth,
     /// Always use the fastest (lowest latency) link first.
@@ -23,7 +29,8 @@ pub enum LoadBalanceStrategy {
 
 impl Default for LoadBalanceStrategy {
     fn default() -> Self {
-        Self::RoundRobin
+        // Use PacketRoundRobin by default for true bandwidth aggregation
+        Self::PacketRoundRobin
     }
 }
 
@@ -34,17 +41,20 @@ impl Default for LoadBalanceStrategy {
 /// unordered aggregation does not guarantee packet ordering or reliability -
 /// these concerns are handled by the application layer.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "dump", derive(serde::Serialize, serde::Deserialize))]
 pub struct UnorderedCfg {
     /// Length of queue for sending data packets.
     ///
     /// This controls how many packets can be queued for sending
     /// when links are temporarily unavailable.
+    #[cfg_attr(feature = "dump", serde(serialize_with = "serde_helpers::serialize_nonzero_usize", deserialize_with = "serde_helpers::deserialize_nonzero_usize"))]
     pub send_queue: NonZeroUsize,
 
     /// Length of queue for received data packets.
     ///
     /// This controls how many packets can be buffered on the
     /// receive side before backpressure is applied.
+    #[cfg_attr(feature = "dump", serde(serialize_with = "serde_helpers::serialize_nonzero_usize", deserialize_with = "serde_helpers::deserialize_nonzero_usize"))]
     pub recv_queue: NonZeroUsize,
 
     /// Load balancing strategy for distributing packets across links.
@@ -53,12 +63,14 @@ pub struct UnorderedCfg {
     /// Interval for sending heartbeat packets to detect link health.
     ///
     /// Shorter intervals provide faster failure detection but increase overhead.
+    #[cfg_attr(feature = "dump", serde(serialize_with = "serde_helpers::serialize_duration", deserialize_with = "serde_helpers::deserialize_duration"))]
     pub heartbeat_interval: Duration,
 
     /// Timeout for considering a link as failed.
     ///
     /// If no heartbeat response is received within this timeout,
     /// the link is considered failed and removed from rotation.
+    #[cfg_attr(feature = "dump", serde(serialize_with = "serde_helpers::serialize_duration", deserialize_with = "serde_helpers::deserialize_duration"))]
     pub link_timeout: Duration,
 
     /// Maximum size of a single packet.
@@ -68,12 +80,14 @@ pub struct UnorderedCfg {
     pub max_packet_size: usize,
 
     /// Queue length for establishing new connections.
+    #[cfg_attr(feature = "dump", serde(serialize_with = "serde_helpers::serialize_nonzero_usize", deserialize_with = "serde_helpers::deserialize_nonzero_usize"))]
     pub connect_queue: NonZeroUsize,
 
     /// Link speed statistics interval durations.
     ///
     /// These intervals are used to calculate throughput statistics
     /// for load balancing decisions.
+    #[cfg_attr(feature = "dump", serde(serialize_with = "serde_helpers::serialize_duration_vec", deserialize_with = "serde_helpers::deserialize_duration_vec"))]
     pub stats_intervals: Vec<Duration>,
 }
 
@@ -215,5 +229,58 @@ mod tests {
         cfg = UnorderedCfg::default();
         cfg.max_packet_size = 70000;
         assert!(cfg.validate().is_err());
+    }
+}
+
+#[cfg(feature = "dump")]
+mod serde_helpers {
+    use serde::{Deserialize, Serialize, Deserializer, Serializer};
+    use std::num::NonZeroUsize;
+    use std::time::Duration;
+
+    pub fn serialize_duration<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        duration.as_millis().serialize(serializer)
+    }
+
+    pub fn deserialize_duration<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let millis = u64::deserialize(deserializer)?;
+        Ok(Duration::from_millis(millis))
+    }
+
+    pub fn serialize_nonzero_usize<S>(value: &NonZeroUsize, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        value.get().serialize(serializer)
+    }
+
+    pub fn deserialize_nonzero_usize<'de, D>(deserializer: D) -> Result<NonZeroUsize, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = usize::deserialize(deserializer)?;
+        NonZeroUsize::new(value).ok_or_else(|| serde::de::Error::custom("value must be non-zero"))
+    }
+
+    pub fn serialize_duration_vec<S>(durations: &Vec<Duration>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let millis: Vec<u64> = durations.iter().map(|d| d.as_millis() as u64).collect();
+        millis.serialize(serializer)
+    }
+
+    pub fn deserialize_duration_vec<'de, D>(deserializer: D) -> Result<Vec<Duration>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let millis = Vec::<u64>::deserialize(deserializer)?;
+        Ok(millis.into_iter().map(Duration::from_millis).collect())
     }
 }

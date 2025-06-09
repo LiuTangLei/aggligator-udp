@@ -64,9 +64,16 @@ pub enum UnorderedLinkMsg {
     ///
     /// Unlike TCP aggregation, this doesn't need sequence numbers
     /// since ordering is handled by the application.
+    /// But for transparent proxy, we need session tracking.
     Data {
         /// Link that sent this data.
         link_id: LinkId,
+        /// Session ID for transparent proxy (optional, 0 means no session)
+        session_id: u64,
+        /// Original client address for transparent proxy (optional)
+        original_client: Option<std::net::SocketAddr>,
+        /// Actual data payload being transmitted
+        payload: Vec<u8>,
     },
 
     /// Link status change notification.
@@ -179,9 +186,39 @@ impl UnorderedLinkMsg {
                 writer.write_u64::<BE>(*timestamp)?;
             }
 
-            UnorderedLinkMsg::Data { link_id } => {
+            UnorderedLinkMsg::Data { link_id, session_id, original_client, payload } => {
                 writer.write_u8(Self::MSG_DATA)?;
                 writer.write_u128::<BE>(link_id.0)?;
+                writer.write_u64::<BE>(*session_id)?;
+                // Write original client address
+                match original_client {
+                    Some(addr) => {
+                        writer.write_u8(1)?; // Has original client
+                        match addr {
+                            std::net::SocketAddr::V4(v4) => {
+                                writer.write_u8(4)?; // IPv4
+                                writer.write_all(&v4.ip().octets())?;
+                                writer.write_u16::<BE>(v4.port())?;
+                            }
+                            std::net::SocketAddr::V6(v6) => {
+                                writer.write_u8(6)?; // IPv6
+                                writer.write_all(&v6.ip().octets())?;
+                                writer.write_u16::<BE>(v6.port())?;
+                            }
+                        }
+                    }
+                    None => {
+                        writer.write_u8(0)?; // No original client
+                    }
+                }
+                // Write payload length and data
+                writer.write_u32::<BE>(
+                    payload
+                        .len()
+                        .try_into()
+                        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "payload too long"))?,
+                )?;
+                writer.write_all(payload)?;
             }
 
             UnorderedLinkMsg::LinkStatus { link_id, status } => {
@@ -271,7 +308,35 @@ impl UnorderedLinkMsg {
 
             Self::MSG_DATA => {
                 let link_id = LinkId(reader.read_u128::<BE>()?);
-                Ok(UnorderedLinkMsg::Data { link_id })
+                let session_id = reader.read_u64::<BE>()?;
+                let original_client = {
+                    let has_addr = reader.read_u8()? != 0;
+                    if has_addr {
+                        let addr_type = reader.read_u8()?;
+                        let ip = match addr_type {
+                            4 => {
+                                let mut octets = [0u8; 4];
+                                reader.read_exact(&mut octets)?;
+                                std::net::IpAddr::from(octets)
+                            }
+                            6 => {
+                                let mut octets = [0u8; 16];
+                                reader.read_exact(&mut octets)?;
+                                std::net::IpAddr::from(octets)
+                            }
+                            _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown address type")),
+                        };
+                        let port = reader.read_u16::<BE>()?;
+                        Some(std::net::SocketAddr::new(ip, port))
+                    } else {
+                        None
+                    }
+                };
+                // Read payload
+                let payload_len = reader.read_u32::<BE>()? as usize;
+                let mut payload = vec![0u8; payload_len];
+                reader.read_exact(&mut payload)?;
+                Ok(UnorderedLinkMsg::Data { link_id, session_id, original_client, payload })
             }
 
             Self::MSG_LINK_STATUS => {
@@ -355,9 +420,10 @@ impl UnorderedCfg {
 
         let strategy_code = match self.load_balance {
             crate::unordered_cfg::LoadBalanceStrategy::RoundRobin => 1,
-            crate::unordered_cfg::LoadBalanceStrategy::WeightedByBandwidth => 2,
-            crate::unordered_cfg::LoadBalanceStrategy::FastestFirst => 3,
-            crate::unordered_cfg::LoadBalanceStrategy::Random => 4,
+            crate::unordered_cfg::LoadBalanceStrategy::PacketRoundRobin => 2,
+            crate::unordered_cfg::LoadBalanceStrategy::WeightedByBandwidth => 3,
+            crate::unordered_cfg::LoadBalanceStrategy::FastestFirst => 4,
+            crate::unordered_cfg::LoadBalanceStrategy::Random => 5,
         };
         writer.write_u8(strategy_code)?;
 
@@ -387,9 +453,10 @@ impl UnorderedCfg {
         let strategy_code = reader.read_u8()?;
         let load_balance = match strategy_code {
             1 => crate::unordered_cfg::LoadBalanceStrategy::RoundRobin,
-            2 => crate::unordered_cfg::LoadBalanceStrategy::WeightedByBandwidth,
-            3 => crate::unordered_cfg::LoadBalanceStrategy::FastestFirst,
-            4 => crate::unordered_cfg::LoadBalanceStrategy::Random,
+            2 => crate::unordered_cfg::LoadBalanceStrategy::PacketRoundRobin,
+            3 => crate::unordered_cfg::LoadBalanceStrategy::WeightedByBandwidth,
+            4 => crate::unordered_cfg::LoadBalanceStrategy::FastestFirst,
+            5 => crate::unordered_cfg::LoadBalanceStrategy::Random,
             _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown load balance strategy")),
         };
 
@@ -437,7 +504,12 @@ mod tests {
             UnorderedLinkMsg::Refused { reason: RefusedReason::GroupFull },
             UnorderedLinkMsg::Ping { timestamp: 1234567890 },
             UnorderedLinkMsg::Pong { timestamp: 1234567890 },
-            UnorderedLinkMsg::Data { link_id: LinkId(5) },
+            UnorderedLinkMsg::Data {
+                link_id: LinkId(5),
+                session_id: 0,
+                original_client: None,
+                payload: b"test data".to_vec(),
+            },
             UnorderedLinkMsg::LinkStatus { link_id: LinkId(7), status: LinkStatus::Slow },
             UnorderedLinkMsg::Goodbye { reason: "test shutdown".to_string() },
         ];

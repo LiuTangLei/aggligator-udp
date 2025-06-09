@@ -15,6 +15,9 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use aggligator::cfg::Cfg;
 use aggligator_transport_tcp::TcpLinkFilter;
 
+/// High-performance session management for UDP transparent proxy
+pub mod session;
+
 /// Initializes logging for command line utilities.
 pub fn init_log() {
     tracing_subscriber::registry().with(fmt::layer()).with(EnvFilter::from_default_env()).init();
