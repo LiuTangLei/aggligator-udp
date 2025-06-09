@@ -1,1299 +1,866 @@
-//! UDP aggregation tool for high-throughput unordered packet aggregation.
+//! Simple UDP aggregation tool - minimal implementation for testing multi-path UDP aggregation.
+//!
+//! This tool provides a basic proxy that can distribute UDP packets across multiple links
+//! for bandwidth aggregation, similar to mptcp but for UDP.
 
-use anyhow::{bail, Context, Result};
-use clap::{CommandFactory, Parser, Subcommand};
+use anyhow::Result;
+use clap::{Parser, Subcommand};
 use crossterm::{style::Stylize, tty::IsTty};
-use serde::{Deserialize, Serialize};
+use rand::{rng, Rng};
 use std::{
     collections::HashMap,
     io::stdout,
     net::SocketAddr,
-    path::PathBuf,
-    sync::{Arc, atomic::{AtomicU64, Ordering}},
-    time::Duration,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
 };
 use tokio::{
     net::UdpSocket,
-    sync::{oneshot, RwLock},
-    time::{sleep, interval},
+    sync::{broadcast, RwLock},
+    time::interval,
 };
-use futures;
-use tracing::{info, error, debug, warn};
+use tracing::{debug, error, info, warn};
 
-use aggligator::{
-    unordered_cfg::{UnorderedCfg, LoadBalanceStrategy},
-    id::LinkId,
-};
-use aggligator_transport_udp::{UdpTransport, UdpAggregationManager};
-use aggligator_util::{init_log, session::{SessionManager, SessionPacket, SessionPacketBuilder}};
+use aggligator::{id::LinkId, unordered_cfg::LoadBalanceStrategy, unordered_task::UnorderedLinkTransport};
+use aggligator_transport_udp::UdpTransport;
+use aggligator_util::init_log;
 
-const DEFAULT_STATS_INTERVAL: u64 = 5; // seconds
-
-/// Configuration structure for UDP aggregation that can be loaded from JSON file
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UdpAggConfig {
-    /// Load balancing strategy
-    pub load_balance: String,
-    /// Send queue size (default: 256)
-    pub send_queue: Option<usize>,
-    /// Receive queue size (default: 256)
-    pub recv_queue: Option<usize>,
-    /// Heartbeat interval in milliseconds (default: 100)
-    pub heartbeat_interval_ms: Option<u64>,
-    /// Link timeout in milliseconds (default: 500)
-    pub link_timeout_ms: Option<u64>,
-    /// Maximum packet size in bytes (default: 1472)
-    pub max_packet_size: Option<usize>,
-    /// Connection queue size (default: 16)
-    pub connect_queue: Option<usize>,
+/// Link performance statistics
+#[derive(Debug, Clone)]
+struct LinkStats {
+    /// Total packets sent on this link
+    packets_sent: u64,
+    /// Total bytes sent on this link
+    bytes_sent: u64,
+    /// Total packets lost (estimated)
+    packets_lost: u64,
+    /// Last round-trip time measurement
+    last_rtt: Option<Duration>,
+    /// Current bandwidth (bytes per second) - calculated over last window
+    bandwidth_bps: u64,
+    /// Last update timestamp
+    last_update: Instant,
+    /// Packet loss rate (0.0 to 1.0)
+    loss_rate: f64,
+    /// Bytes sent in current measurement window
+    window_bytes: u64,
+    /// Window start time
+    window_start: Instant,
 }
 
-impl Default for UdpAggConfig {
+impl Default for LinkStats {
     fn default() -> Self {
+        let now = Instant::now();
         Self {
-            load_balance: "packet-round-robin".to_string(), // Use packet-round-robin for true bandwidth aggregation
-            send_queue: None,
-            recv_queue: None,
-            heartbeat_interval_ms: None,
-            link_timeout_ms: None,
-            max_packet_size: None,
-            connect_queue: None,
+            packets_sent: 0,
+            bytes_sent: 0,
+            packets_lost: 0,
+            last_rtt: None,
+            bandwidth_bps: 0,
+            last_update: now,
+            loss_rate: 0.0,
+            window_bytes: 0,
+            window_start: now,
         }
     }
 }
 
-impl UdpAggConfig {
-    /// Convert to UnorderedCfg with validation
-    pub fn to_unordered_cfg(&self) -> Result<UnorderedCfg> {
-        let load_balance = match self.load_balance.as_str() {
-            "round-robin" => LoadBalanceStrategy::RoundRobin,
-            "packet-round-robin" => LoadBalanceStrategy::PacketRoundRobin,
-            "random" => LoadBalanceStrategy::Random,
-            "weighted" => LoadBalanceStrategy::WeightedByBandwidth,
-            "fastest" => LoadBalanceStrategy::FastestFirst,
-            _ => bail!("Invalid load balance strategy: {}. Valid options: round-robin, packet-round-robin, random, weighted, fastest", self.load_balance),
-        };
+impl LinkStats {
+    fn update_send_stats(&mut self, bytes: usize) {
+        let now = Instant::now();
+        self.packets_sent += 1;
+        self.bytes_sent += bytes as u64;
+        self.window_bytes += bytes as u64;
 
-        let mut config = UnorderedCfg {
-            load_balance,
-            ..UnorderedCfg::default()
-        };
-
-        if let Some(send_queue) = self.send_queue {
-            config.send_queue = std::num::NonZeroUsize::new(send_queue)
-                .context("send_queue must be greater than 0")?;
+        // Update bandwidth calculation with sliding window (5 second window)
+        let window_duration = now.duration_since(self.window_start);
+        if window_duration >= Duration::from_secs(5) {
+            // Calculate bandwidth over the window
+            self.bandwidth_bps = (self.window_bytes as f64 / window_duration.as_secs_f64()) as u64;
+            
+            // Reset window
+            self.window_bytes = 0;
+            self.window_start = now;
         }
+        
+        self.last_update = now;
+    }
 
-        if let Some(recv_queue) = self.recv_queue {
-            config.recv_queue = std::num::NonZeroUsize::new(recv_queue)
-                .context("recv_queue must be greater than 0")?;
+    fn update_loss_stats(&mut self, lost_packets: u64) {
+        self.packets_lost += lost_packets;
+        if self.packets_sent > 0 {
+            self.loss_rate = self.packets_lost as f64 / self.packets_sent as f64;
         }
+    }
 
-        if let Some(ms) = self.heartbeat_interval_ms {
-            config.heartbeat_interval = Duration::from_millis(ms);
+    fn get_weight_for_bandwidth(&self) -> f64 {
+        if self.bandwidth_bps == 0 {
+            1.0
+        } else {
+            self.bandwidth_bps as f64
         }
+    }
 
-        if let Some(ms) = self.link_timeout_ms {
-            config.link_timeout = Duration::from_millis(ms);
-        }
+    fn get_weight_for_loss(&self) -> f64 {
+        // Higher weight for lower loss rate
+        1.0 - self.loss_rate.min(0.99)
+    }
 
-        if let Some(size) = self.max_packet_size {
-            config.max_packet_size = size;
-        }
+    fn get_adaptive_weight(&self) -> f64 {
+        // Combine bandwidth and loss rate with exploration factor
+        let bandwidth_weight = self.get_weight_for_bandwidth();
+        let loss_weight = self.get_weight_for_loss();
+        let exploration_factor = 0.1; // 10% exploration to prevent link starvation
 
-        if let Some(connect_queue) = self.connect_queue {
-            config.connect_queue = std::num::NonZeroUsize::new(connect_queue)
-                .context("connect_queue must be greater than 0")?;
-        }
-
-        if let Err(e) = config.validate() {
-            bail!("Invalid configuration: {}", e);
-        }
-        Ok(config)
+        (bandwidth_weight * loss_weight * 0.9) + exploration_factor
     }
 }
 
-/// Load UDP aggregation configuration from file or use default
-pub fn load_udp_config(path: &Option<PathBuf>) -> Result<UnorderedCfg> {
-    match path {
-        Some(path) => {
-            let file = std::fs::File::open(path)
-                .with_context(|| format!("Cannot open configuration file: {}", path.display()))?;
-            let config: UdpAggConfig = serde_json::from_reader(file)
-                .with_context(|| format!("Cannot parse configuration file: {}", path.display()))?;
-            config.to_unordered_cfg()
-        }
-        None => Ok(UnorderedCfg::default()),
-    }
-}
-
-/// Print the default UDP configuration
-pub fn print_default_udp_cfg() {
-    let default_config = UdpAggConfig::default();
-    let json = serde_json::to_string_pretty(&default_config).unwrap();
-    println!("{}", json);
-}
-
-/// Connection statistics for monitoring
-#[derive(Default)]
-pub struct ConnectionStats {
-    pub packets_sent: AtomicU64,
-    pub packets_received: AtomicU64,
-    pub bytes_sent: AtomicU64,
-    pub bytes_received: AtomicU64,
-    pub connections_established: AtomicU64,
-    pub connection_errors: AtomicU64,
-}
-
-impl ConnectionStats {
-    pub fn new() -> Self {
-        Self::default()
-    }
-    
-    pub fn record_packet_sent(&self, bytes: usize) {
-        self.packets_sent.fetch_add(1, Ordering::Relaxed);
-        self.bytes_sent.fetch_add(bytes as u64, Ordering::Relaxed);
-    }
-    
-    pub fn record_packet_received(&self, bytes: usize) {
-        self.packets_received.fetch_add(1, Ordering::Relaxed);
-        self.bytes_received.fetch_add(bytes as u64, Ordering::Relaxed);
-    }
-    
-    pub fn record_connection_established(&self) {
-        self.connections_established.fetch_add(1, Ordering::Relaxed);
-    }
-    
-    pub fn record_connection_error(&self) {
-        self.connection_errors.fetch_add(1, Ordering::Relaxed);
-    }
-    
-    pub fn get_summary(&self) -> (u64, u64, u64, u64, u64, u64) {
-        (
-            self.packets_sent.load(Ordering::Relaxed),
-            self.packets_received.load(Ordering::Relaxed),
-            self.bytes_sent.load(Ordering::Relaxed),
-            self.bytes_received.load(Ordering::Relaxed),
-            self.connections_established.load(Ordering::Relaxed),
-            self.connection_errors.load(Ordering::Relaxed),
-        )
-    }
-}
-
-/// Print connection status with styling
-pub fn print_status(message: &str, status: &str, use_color: bool) {
-    if use_color {
-        println!("{} {}", "🔗".blue(), format!("{}: {}", message, status).bold());
-    } else {
-        println!("🔗 {}: {}", message, status);
-    }
-}
-
-/// Print error with styling
-pub fn print_error(message: &str, error: &str, use_color: bool) {
-    if use_color {
-        println!("{} {}", "❌".red(), format!("{}: {}", message, error).red());
-    } else {
-        println!("❌ {}: {}", message, error);
-    }
-}
-
-/// Print success with styling
-pub fn print_success(message: &str, use_color: bool) {
-    if use_color {
-        println!("{} {}", "✅".green(), message.green());
-    } else {
-        println!("✅ {}", message);
-    }
-}
-
-/// Print statistics summary
-pub fn print_stats(stats: &ConnectionStats, use_color: bool) {
-    let (packets_sent, packets_received, bytes_sent, bytes_received, connections, errors) = stats.get_summary();
-    
-    let stats_msg = format!(
-        "📊 Stats: {} pkts sent ({:.2} MB), {} pkts recv ({:.2} MB), {} conns, {} errors",
-        packets_sent,
-        bytes_sent as f64 / 1024.0 / 1024.0,
-        packets_received,
-        bytes_received as f64 / 1024.0 / 1024.0,
-        connections,
-        errors
-    );
-    
-    if use_color {
-        println!("{}", stats_msg.cyan());
-    } else {
-        println!("{}", stats_msg);
-    }
-}
-
-#[derive(Parser)]
-#[command(name = "agg-udp", author, version)]
-pub struct UdpCli {
-    /// Configuration file for advanced settings.
-    #[arg(long)]
-    cfg: Option<PathBuf>,
-    /// Enable verbose debug logging.
-    #[arg(long, short = 'v')]
-    verbose: bool,
-    /// Statistics reporting interval in seconds.
-    #[arg(long, default_value_t = DEFAULT_STATS_INTERVAL)]
-    stats_interval: u64,
-    /// Client or server mode.
+/// Simple UDP aggregation CLI tool
+#[derive(Debug, Parser)]
+#[command(name = "agg-udp-simple")]
+#[command(about = "Simple UDP multi-path aggregation tool")]
+struct SimpleCli {
     #[command(subcommand)]
     command: Commands,
+
+    /// Verbose logging
+    #[arg(short, long)]
+    verbose: bool,
 }
 
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 enum Commands {
-    /// Run as UDP aggregation client.
-    Client(ClientCli),
-    /// Run as UDP aggregation server/relay.
-    Server(ServerCli),
-    /// Run performance test between client and server.
-    Test(TestCli),
-    /// Shows the default configuration.
-    ShowCfg,
-    /// Generate manual pages for this tool in current directory.
-    #[command(hide = true)]
-    ManPages,
-    /// Generate markdown page for this tool.
-    #[command(hide = true)]
-    Markdown,
+    /// Run as client (aggregate outgoing packets)
+    Client {
+        /// Local bind address
+        #[arg(short, long, default_value = "127.0.0.1:8000")]
+        local: SocketAddr,
+        /// Target servers to aggregate across
+        #[arg(short, long)]
+        targets: Vec<SocketAddr>,
+        /// Load balancing strategy: packet-round-robin, weighted-bandwidth, fastest-first, weighted-packet-loss, dynamic-adaptive
+        #[arg(long, default_value = "packet-round-robin")]
+        strategy: String,
+        /// Node role for directional bandwidth prioritization: client, server, balanced
+        #[arg(long, default_value = "balanced")]
+        role: String,
+        /// Do not display the link monitor
+        #[arg(long, short = 'n')]
+        no_monitor: bool,
+    },
+    /// Run as server (collect aggregated packets)
+    Server {
+        /// Listen addresses (multiple interfaces for aggregation)
+        #[arg(short, long)]
+        listen: Vec<SocketAddr>,
+        /// Target backend server
+        #[arg(short, long, default_value = "127.0.0.1:9000")]
+        target: SocketAddr,
+        /// Do not display the link monitor
+        #[arg(long, short = 'n')]
+        no_monitor: bool,
+    },
 }
 
-#[derive(Parser)]
-pub struct ClientCli {
-    /// Use IPv4 only.
-    #[arg(long, short = '4')]
-    ipv4: bool,
-    /// Use IPv6 only.
-    #[arg(long, short = '6')]
-    ipv6: bool,
-    /// Local address to bind UDP client sockets.
-    #[arg(long, short = 'b', default_value = "0.0.0.0:0")]
-    bind: SocketAddr,
-    /// Remote server addresses and ports.
-    ///
-    /// Can be specified multiple times to create multiple aggregation links.
-    /// Format: ip:port or hostname:port
-    #[arg(long, short = 'r', required = true)]
-    remote: Vec<String>,
-    /// Local proxy port to listen for client connections (transparent proxy mode).
-    #[arg(long)]
-    proxy_port: Option<u16>,
-    /// Target server address for transparent proxy mode.
-    #[arg(long)]
-    target: Option<SocketAddr>,
-    /// Session timeout in seconds for transparent proxy.
-    #[arg(long, default_value_t = 60)]
-    session_timeout: u64,
-    /// Load balancing strategy.
-    ///
-    /// round-robin: distribute packets evenly across links.
-    /// random: randomly select link for each packet.
-    /// weighted: use link performance metrics for selection.
-    /// fastest: always use the fastest (lowest latency) link first.
-    #[arg(long, default_value = "round-robin")]
-    load_balance: String,
-    /// Maximum number of packets to send in test mode.
-    #[arg(long)]
-    max_packets: Option<usize>,
-    /// Packet size for test mode (bytes).
-    #[arg(long, default_value_t = 1400)]
-    packet_size: usize,
-    /// Send rate in packets per second (0 = unlimited).
-    #[arg(long, default_value_t = 0)]
-    rate: u64,
+/// Simple UDP packet aggregator
+struct SimpleUdpAggregator {
+    /// Map of links by ID
+    links: Arc<RwLock<HashMap<LinkId, Arc<UdpTransport>>>>,
+    /// Load balancing strategy
+    strategy: LoadBalanceStrategy,
+    /// Round-robin counter
+    rr_counter: AtomicU64,
+    /// Statistics
+    packets_sent: AtomicU64,
+    bytes_sent: AtomicU64,
+    /// Per-link performance statistics
+    link_stats: Arc<RwLock<HashMap<LinkId, LinkStats>>>,
 }
 
-#[derive(Parser)]
-pub struct ServerCli {
-    /// Use IPv4 only.
-    #[arg(long, short = '4')]
-    ipv4: bool,
-    /// Use IPv6 only.
-    #[arg(long, short = '6')]
-    ipv6: bool,
-    /// Local addresses to bind server sockets.
-    ///
-    /// Can be specified multiple times to listen on multiple interfaces.
-    /// Format: ip:port or hostname:port
-    #[arg(long, short = 'l', default_value = "0.0.0.0:5801")]
-    listen: Vec<String>,
-    /// Echo received packets back to sender.
-    #[arg(long, short = 'e')]
-    echo: bool,
-    /// Forward packets to destination address.
-    #[arg(long, short = 'f')]
-    forward: Option<SocketAddr>,
-    /// Session timeout in seconds for transparent proxy.
-    #[arg(long, default_value_t = 60)]
-    session_timeout: u64,
+impl SimpleUdpAggregator {
+    pub fn new(strategy: LoadBalanceStrategy) -> Self {
+        Self {
+            links: Arc::new(RwLock::new(HashMap::new())),
+            strategy,
+            rr_counter: AtomicU64::new(0),
+            packets_sent: AtomicU64::new(0),
+            bytes_sent: AtomicU64::new(0),
+            link_stats: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Add a link to the aggregator
+    pub async fn add_link(&self, link_id: LinkId, transport: Arc<UdpTransport>) {
+        self.links.write().await.insert(link_id, transport);
+        self.link_stats.write().await.insert(link_id, LinkStats::default());
+        info!("Added link {} to aggregator", link_id.0);
+    }
+
+    /// Send data using load balancing
+    pub async fn send_data(&self, data: &[u8]) -> Result<()> {
+        let links = self.links.read().await;
+        if links.is_empty() {
+            warn!("No links available for sending");
+            return Ok(());
+        }
+
+        // Select link based on load balancing strategy
+        let selected_link_id = self.select_link(&links).await;
+
+        if let Some(transport) = links.get(&selected_link_id) {
+            match transport.send_raw(data).await {
+                Ok(_bytes) => {
+                    // Update statistics
+                    self.packets_sent.fetch_add(1, Ordering::Relaxed);
+                    self.bytes_sent.fetch_add(data.len() as u64, Ordering::Relaxed);
+
+                    // Update per-link statistics
+                    if let Some(stats) = self.link_stats.write().await.get_mut(&selected_link_id) {
+                        stats.update_send_stats(data.len());
+                    }
+
+                    debug!("Sent {} bytes via link {} using strategy {:?}", data.len(), selected_link_id.0, self.strategy);
+                }
+                Err(e) => {
+                    error!("Failed to send via link {}: {}", selected_link_id.0, e);
+
+                    // Update loss statistics
+                    if let Some(stats) = self.link_stats.write().await.get_mut(&selected_link_id) {
+                        stats.update_loss_stats(1);
+                    }
+                }
+            }
+        } else {
+            error!("Selected link {} not found in links map", selected_link_id.0);
+        }
+
+        Ok(())
+    }
+
+    /// Select a link based on the configured load balancing strategy
+    async fn select_link(&self, links: &HashMap<LinkId, Arc<UdpTransport>>) -> LinkId {
+        match self.strategy {
+            LoadBalanceStrategy::PacketRoundRobin => {
+                let count = self.rr_counter.fetch_add(1, Ordering::Relaxed);
+                let index = (count as usize) % links.len();
+                *links.keys().nth(index).unwrap()
+            }
+
+            LoadBalanceStrategy::WeightedByBandwidth => self.select_weighted_by_bandwidth(links).await,
+
+            LoadBalanceStrategy::FastestFirst => self.select_fastest_link(links).await,
+
+            LoadBalanceStrategy::WeightedByPacketLoss => self.select_weighted_by_loss(links).await,
+
+            LoadBalanceStrategy::DynamicAdaptive => self.select_adaptive(links).await,
+        }
+    }
+
+    /// Select link weighted by bandwidth
+    async fn select_weighted_by_bandwidth(&self, links: &HashMap<LinkId, Arc<UdpTransport>>) -> LinkId {
+        let stats = self.link_stats.read().await;
+        let mut best_link = *links.keys().next().unwrap();
+        let mut best_bandwidth = 0u64;
+
+        for link_id in links.keys() {
+            let bandwidth = if let Some(link_stats) = stats.get(link_id) {
+                link_stats.bandwidth_bps
+            } else {
+                1000000 // Default 1 Mbps for new links
+            };
+            
+            if bandwidth > best_bandwidth {
+                best_bandwidth = bandwidth;
+                best_link = *link_id;
+            }
+        }
+
+        best_link
+    }
+
+    /// Select fastest (lowest latency) link
+    async fn select_fastest_link(&self, links: &HashMap<LinkId, Arc<UdpTransport>>) -> LinkId {
+        let stats = self.link_stats.read().await;
+        let mut best_link = *links.keys().next().unwrap();
+        let mut best_rtt = Duration::from_secs(u64::MAX);
+
+        for link_id in links.keys() {
+            let rtt = if let Some(link_stats) = stats.get(link_id) {
+                link_stats.last_rtt.unwrap_or(Duration::from_millis(100)) // Default 100ms
+            } else {
+                Duration::from_millis(50) // New links get priority with 50ms default
+            };
+            
+            if rtt < best_rtt {
+                best_rtt = rtt;
+                best_link = *link_id;
+            }
+        }
+
+        best_link
+    }
+
+    /// Select link weighted by packet loss (favor low loss links)
+    async fn select_weighted_by_loss(&self, links: &HashMap<LinkId, Arc<UdpTransport>>) -> LinkId {
+        let stats = self.link_stats.read().await;
+        let mut best_link = *links.keys().next().unwrap();
+        let mut best_weight = 0.0f64;
+
+        for link_id in links.keys() {
+            let weight = if let Some(link_stats) = stats.get(link_id) {
+                link_stats.get_weight_for_loss()
+            } else {
+                1.0 // New links get full weight
+            };
+            
+            if weight > best_weight {
+                best_weight = weight;
+                best_link = *link_id;
+            }
+        }
+
+        best_link
+    }
+
+    /// Dynamic adaptive selection combining multiple factors
+    async fn select_adaptive(&self, links: &HashMap<LinkId, Arc<UdpTransport>>) -> LinkId {
+        let stats = self.link_stats.read().await;
+        let mut weights: Vec<(LinkId, f64)> = Vec::new();
+        let mut total_weight = 0.0f64;
+
+        // Calculate weights for all links
+        for link_id in links.keys() {
+            let weight = if let Some(link_stats) = stats.get(link_id) {
+                link_stats.get_adaptive_weight()
+            } else {
+                1.5 // Give new links slightly higher weight for exploration
+            };
+            weights.push((*link_id, weight));
+            total_weight += weight;
+        }
+
+        if total_weight == 0.0 {
+            // Fallback to round-robin if no weights
+            let count = self.rr_counter.fetch_add(1, Ordering::Relaxed);
+            let index = (count as usize) % links.len();
+            return *links.keys().nth(index).unwrap();
+        }
+
+        // Weighted random selection
+        let mut rng = rng();
+        let mut random_value = rng.random::<f64>() * total_weight;
+
+        for (link_id, weight) in weights {
+            random_value -= weight;
+            if random_value <= 0.0 {
+                return link_id;
+            }
+        }
+
+        // Fallback (should not reach here)
+        *links.keys().next().unwrap()
+    }
+
+    /// Get statistics
+    pub fn stats(&self) -> (u64, u64) {
+        (self.packets_sent.load(Ordering::Relaxed), self.bytes_sent.load(Ordering::Relaxed))
+    }
+
+    /// Get detailed link statistics
+    pub async fn link_stats(&self) -> HashMap<LinkId, LinkStats> {
+        self.link_stats.read().await.clone()
+    }
 }
 
-#[derive(Parser)]
-pub struct TestCli {
-    /// Use IPv4 only.
-    #[arg(long, short = '4')]
-    ipv4: bool,
-    /// Use IPv6 only.
-    #[arg(long, short = '6')]
-    ipv6: bool,
-    /// Local address to bind test client.
-    #[arg(long, short = 'b', default_value = "0.0.0.0:0")]
-    bind: SocketAddr,
-    /// Remote server addresses for performance test.
-    #[arg(long, short = 'r', required = true)]
-    remote: Vec<String>,
-    /// Test duration in seconds.
-    #[arg(long, short = 'd', default_value_t = 10)]
-    duration: u64,
-    /// Packet size for test (bytes).
-    #[arg(long, default_value_t = 1400)]
-    packet_size: usize,
-    /// Send rate in packets per second (0 = unlimited).
-    #[arg(long, default_value_t = 1000)]
-    rate: u64,
-    /// Load balancing strategy for test.
-    #[arg(long, default_value = "round-robin")]
-    load_balance: String,
+/// UDP session for tracking client connections
+#[derive(Debug)]
+struct UdpSession {
+    client_addr: SocketAddr,
+    last_activity: Instant,
+    sequence: AtomicU64,
+}
+
+impl Clone for UdpSession {
+    fn clone(&self) -> Self {
+        Self {
+            client_addr: self.client_addr,
+            last_activity: self.last_activity,
+            sequence: AtomicU64::new(self.sequence.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+impl UdpSession {
+    fn new(client_addr: SocketAddr) -> Self {
+        Self { 
+            client_addr, 
+            last_activity: Instant::now(), 
+            sequence: AtomicU64::new(0),
+        }
+    }
+
+    fn update_activity(&mut self) {
+        self.last_activity = Instant::now();
+    }
+
+    fn is_expired(&self, timeout: Duration) -> bool {
+        self.last_activity.elapsed() > timeout
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = UdpCli::parse();
+    let cli = SimpleCli::parse();
 
-    // Initialize logging with appropriate level
     if cli.verbose {
-        tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
-            .init();
+        tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).init();
     } else {
         init_log();
     }
 
     match cli.command {
-        Commands::Client(client) => client.run(cli.stats_interval, &cli.cfg).await?,
-        Commands::Server(server) => server.run(cli.stats_interval, &cli.cfg).await?,
-        Commands::Test(test) => test.run(cli.stats_interval, &cli.cfg).await?,
-        Commands::ShowCfg => print_default_udp_cfg(),
-        Commands::ManPages => clap_mangen::generate_to(UdpCli::command(), ".")?,
-        Commands::Markdown => println!("{}", clap_markdown::help_markdown::<UdpCli>()),
+        Commands::Client { local, targets, strategy, role, no_monitor } => {
+            run_client(local, targets, strategy, role, no_monitor).await
+        }
+        Commands::Server { listen, target, no_monitor } => run_server(listen, target, no_monitor).await,
+    }
+}
+
+async fn run_client(
+    local: SocketAddr, targets: Vec<SocketAddr>, strategy: String, role: String, no_monitor: bool,
+) -> Result<()> {
+    let no_monitor = no_monitor || !stdout().is_tty();
+
+    info!("Starting UDP transparent proxy on {}", local);
+    info!("Targets: {:?}", targets);
+    info!("Strategy: {}", strategy);
+    info!("Role: {}", role);
+
+    let strategy = match strategy.as_str() {
+        "packet-round-robin" => LoadBalanceStrategy::PacketRoundRobin,
+        "weighted-bandwidth" => LoadBalanceStrategy::WeightedByBandwidth,
+        "fastest-first" => LoadBalanceStrategy::FastestFirst,
+        "weighted-packet-loss" => LoadBalanceStrategy::WeightedByPacketLoss,
+        "dynamic-adaptive" => LoadBalanceStrategy::DynamicAdaptive,
+        _ => LoadBalanceStrategy::PacketRoundRobin, // Default to packet-level round-robin
+    };
+
+    // Create aggregator
+    let aggregator = Arc::new(SimpleUdpAggregator::new(strategy));
+
+    // Session tracking for UDP connections
+    let sessions: Arc<RwLock<HashMap<SocketAddr, UdpSession>>> = Arc::new(RwLock::new(HashMap::new()));
+    let session_timeout = Duration::from_secs(60); // 60 second timeout
+
+    // Set up links to all targets using system-selected local addresses
+    let mut receive_sockets = Vec::new();
+    for (i, target) in targets.iter().enumerate() {
+        // Let the system choose the appropriate local interface by using new_unbound
+        match UdpTransport::new_unbound(*target).await {
+            Ok(transport) => {
+                let transport = Arc::new(transport);
+
+                // Store socket for receiving responses
+                let recv_socket = transport.socket();
+                receive_sockets.push((recv_socket, *target, LinkId(i as u128)));
+
+                aggregator.add_link(LinkId(i as u128), transport).await;
+                info!("Connected to target {} with auto-selected local address", target);
+            }
+            Err(e) => {
+                error!("Failed to connect to target {}: {}", target, e);
+                return Err(e.into());
+            }
+        }
+    }
+
+    // Bind local socket for receiving client requests
+    let client_socket = Arc::new(UdpSocket::bind(local).await?);
+    info!("Transparent proxy listening on {}", local);
+
+    // Create monitoring channels
+    let (control_tx, control_rx) = broadcast::channel::<String>(100);
+
+    // Statistics
+    let stats_aggregator = aggregator.clone();
+    let stats_control_tx = control_tx.clone();
+    let stats_task = tokio::spawn(async move {
+        let mut interval = interval(Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            let (packets, bytes) = stats_aggregator.stats();
+            let link_stats = stats_aggregator.link_stats().await;
+            
+            // Create detailed status message with per-link statistics
+            let mut status = format!("UDP Proxy - {} packets, {} bytes forwarded\n", packets, bytes);
+            
+            if !link_stats.is_empty() {
+                status.push_str("Link Details:\n");
+                for (link_id, stats) in link_stats.iter() {
+                    let bandwidth_kbps = if stats.bandwidth_bps > 0 {
+                        stats.bandwidth_bps / 1024
+                    } else {
+                        0
+                    };
+                    let loss_percentage = (stats.loss_rate * 100.0) as u32;
+                    
+                    status.push_str(&format!(
+                        "  Link {}: {} pkts, {} KB, {} KB/s, {}% loss\n",
+                        link_id.0,
+                        stats.packets_sent,
+                        stats.bytes_sent / 1024,
+                        bandwidth_kbps,
+                        loss_percentage
+                    ));
+                }
+            }
+            
+            let _ = stats_control_tx.send(status);
+
+            if !no_monitor {
+                debug!("Stats: {} packets, {} bytes forwarded", packets, bytes);
+            } else {
+                info!("Stats: {} packets, {} bytes forwarded", packets, bytes);
+            }
+        }
+    });
+
+    // Session cleanup task
+    let sessions_cleanup = sessions.clone();
+    let cleanup_task = tokio::spawn(async move {
+        let mut interval = interval(Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            let mut sessions = sessions_cleanup.write().await;
+            sessions.retain(|_, session| !session.is_expired(session_timeout));
+            debug!("Active sessions: {}", sessions.len());
+        }
+    });
+
+    // Client to server forwarding task
+    let client_sessions = sessions.clone();
+    let forward_aggregator = aggregator.clone();
+    let forward_socket = client_socket.clone();
+    let forward_task = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65536];
+        loop {
+            match forward_socket.recv_from(&mut buf).await {
+                Ok((len, client_addr)) => {
+                    debug!("Received {} bytes from client {}", len, client_addr);
+
+                    // Update or create session
+                    {
+                        let mut sessions = client_sessions.write().await;
+                        match sessions.get_mut(&client_addr) {
+                            Some(session) => {
+                                session.update_activity();
+                            }
+                            None => {
+                                sessions.insert(client_addr, UdpSession::new(client_addr));
+                                info!("New client session: {}", client_addr);
+                            }
+                        }
+                    }
+
+                    // Forward to aggregated targets
+                    if let Err(e) = forward_aggregator.send_data(&buf[..len]).await {
+                        error!("Failed to forward packet from {}: {}", client_addr, e);
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to receive from client: {}", e);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
+    });
+
+    // Server to client response handling tasks
+    let mut response_tasks = Vec::new();
+    for (recv_socket, target_addr, link_id) in receive_sockets {
+        let sessions_resp = sessions.clone();
+        let client_socket_resp = client_socket.clone();
+        let task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 65536];
+            info!("Listening for responses from {} (link {})", target_addr, link_id.0);
+
+            loop {
+                match recv_socket.recv(&mut buf).await {
+                    Ok(len) => {
+                        debug!("Received {} bytes response from {} (link {})", len, target_addr, link_id.0);
+
+                        // Forward response to all active clients
+                        // In a more sophisticated implementation, you'd track which client
+                        // sent the original request and only send to that client
+                        let sessions = sessions_resp.read().await;
+                        for (client_addr, _session) in sessions.iter() {
+                            if let Err(e) = client_socket_resp.send_to(&buf[..len], client_addr).await {
+                                debug!("Failed to send response to client {}: {}", client_addr, e);
+                            } else {
+                                debug!("Forwarded response to client {}", client_addr);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to receive response from {} (link {}): {}", target_addr, link_id.0, e);
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
+            }
+        });
+        response_tasks.push(task);
+    }
+
+    let title = format!("UDP Transparent Proxy - {} -> {:?}", local, targets);
+
+    if no_monitor {
+        drop(control_rx);
+        eprintln!("{}", title);
+
+        // Wait for all tasks
+        tokio::select! {
+            _ = stats_task => {},
+            _ = cleanup_task => {},
+            _ = forward_task => {},
+            _ = futures::future::join_all(response_tasks) => {},
+        }
+    } else {
+        eprintln!("{}", title.clone().bold());
+
+        // Simple monitoring
+        let title_monitor = title.clone();
+        let monitor_task = tokio::spawn(async move {
+            let mut control_rx = control_rx;
+            loop {
+                match control_rx.recv().await {
+                    Ok(status) => {
+                        // Clear previous output and print new status
+                        eprint!("\x1B[2J\x1B[H"); // Clear screen and move cursor to top
+                        eprint!("{}", title_monitor.clone().bold());
+                        eprint!("\n{}", status);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        tokio::select! {
+            _ = stats_task => {},
+            _ = cleanup_task => {},
+            _ = forward_task => {},
+            _ = monitor_task => {},
+            _ = futures::future::join_all(response_tasks) => {},
+        }
     }
 
     Ok(())
 }
 
-impl ClientCli {
-    async fn run(self, stats_interval: u64, cfg_path: &Option<PathBuf>) -> Result<()> {
-        let use_color = stdout().is_tty();
-        let stats = Arc::new(ConnectionStats::new());
-        
-        print_status("UDP Aggregation Client", "Starting up", use_color);
+async fn run_server(listen_addrs: Vec<SocketAddr>, target: SocketAddr, no_monitor: bool) -> Result<()> {
+    let no_monitor = no_monitor || !stdout().is_tty();
 
-        // Load configuration from file or use defaults with CLI overrides
-        let mut config = load_udp_config(cfg_path)?;
-        
-        // Override load balancing strategy if specified via CLI
-        let load_balance = match self.load_balance.as_str() {
-            "round-robin" => LoadBalanceStrategy::RoundRobin,
-            "random" => LoadBalanceStrategy::Random,
-            "weighted" => LoadBalanceStrategy::WeightedByBandwidth,
-            "fastest" => LoadBalanceStrategy::FastestFirst,
-            _ => {
-                print_error("Configuration", &format!("Invalid load balance strategy: {}", self.load_balance), use_color);
-                bail!("Invalid load balance strategy: {}", self.load_balance);
-            }
-        };
-        config.load_balance = load_balance;
+    info!("Starting UDP aggregation server");
+    info!("Listen addresses: {:?}", listen_addrs);
+    info!("Target backend: {}", target);
 
-        print_status("Load Balancing", &self.load_balance, use_color);
-        
-        if cfg_path.is_some() {
-            print_status("Configuration", "Loaded from file", use_color);
-        }
+    // Create monitoring channels - simplified for UDP
+    let (control_tx, control_rx) = broadcast::channel::<String>(100);
 
-        // Create UDP aggregation manager
-        print_status("Aggregation Manager", "Initializing", use_color);
-        let manager = UdpAggregationManager::new(config).await
-            .context("Failed to create UDP aggregation manager")?;
-        print_success("Aggregation Manager ready", use_color);
+    let mut handles = Vec::new();
+    let stats = Arc::new(AtomicU64::new(0));
 
-        // Parse and connect to remote addresses
-        let mut link_id = 1u128;
-        let total_remotes = self.remote.len();
-        
-        if use_color {
-            println!("{} Connecting to {} remote server(s):", "🔗".blue(), total_remotes.to_string().bold());
-        } else {
-            println!("🔗 Connecting to {} remote server(s):", total_remotes);
-        }
-        
-        for (idx, remote_str) in self.remote.iter().enumerate() {
-            let remote_addr: SocketAddr = remote_str.parse()
-                .with_context(|| format!("Invalid remote address: {}", remote_str))?;
-
-            if use_color {
-                println!("  [{}/{}] 📡 Connecting to {}...", (idx + 1).to_string().cyan(), total_remotes.to_string().cyan(), remote_addr.to_string().yellow());
-            } else {
-                println!("  [{}/{}] 📡 Connecting to {}...", idx + 1, total_remotes, remote_addr);
-            }
-
-            // Create UDP transport
-            match UdpTransport::connect(self.bind, remote_addr).await {
-                Ok(transport) => {
-                    let local_addr = transport.local_addr();
-                    if use_color {
-                        println!("  [{}/{}] ✅ Connected {} -> {} (local: {})", 
-                                (idx + 1).to_string().cyan(), 
-                                total_remotes.to_string().cyan(), 
-                                link_id.to_string().green(), 
-                                remote_addr.to_string().yellow(),
-                                local_addr.to_string().dim());
-                    } else {
-                        println!("  [{}/{}] ✅ Connected {} -> {} (local: {})", 
-                                idx + 1, total_remotes, link_id, remote_addr, local_addr);
-                    }
-
-                    // Add to aggregation
-                    match manager.add_udp_link(LinkId(link_id), transport).await {
-                        Ok(_) => {
-                            if use_color {
-                                println!("  [{}/{}] 🚀 Added link {} to aggregation", 
-                                        (idx + 1).to_string().cyan(), 
-                                        total_remotes.to_string().cyan(), 
-                                        link_id.to_string().green());
-                            } else {
-                                println!("  [{}/{}] 🚀 Added link {} to aggregation", idx + 1, total_remotes, link_id);
-                            }
-                            stats.record_connection_established();
-                        }
-                        Err(e) => {
-                            stats.record_connection_error();
-                            print_error(&format!("Link {}", link_id), &format!("Failed to add to aggregation: {}", e), use_color);
-                            return Err(e.into());
-                        }
-                    }
-                }
-                Err(e) => {
-                    stats.record_connection_error();
-                    print_error(&format!("Connection to {}", remote_addr), &e.to_string(), use_color);
-                    return Err(e.into());
-                }
-            }
-
-            link_id += 1;
-        }
-
-        if use_color {
-            println!("{} All {} links connected successfully!", "🌐".green().bold(), total_remotes.to_string().bold().green());
-        } else {
-            println!("🌐 All {} links connected successfully!", total_remotes);
-        }
-
-        // Start statistics reporting
-        let stats_clone = stats.clone();
-        let manager_stats = manager.control_sender();
-        tokio::spawn(async move {
-            let mut interval = interval(Duration::from_secs(stats_interval));
-            loop {
-                interval.tick().await;
-                
-                print_stats(&stats_clone, use_color);
-                
-                let (tx, rx) = oneshot::channel();
-                if manager_stats.send(aggligator::unordered_task::UnorderedControlMsg::GetStats { respond_to: tx }).is_ok() {
-                    if let Ok(link_stats) = rx.await {
-                        if use_color {
-                            println!("{} Aggregation: {} active links, {} healthy, {:.2} MB sent, {:.2} MB received",
-                                    "📊".cyan(),
-                                    link_stats.active_links.to_string().bold(),
-                                    link_stats.healthy_links.to_string().green(),
-                                    link_stats.total_bytes_sent as f64 / 1024.0 / 1024.0,
-                                    link_stats.total_bytes_received as f64 / 1024.0 / 1024.0
-                            );
-                        } else {
-                            println!("📊 Aggregation: {} active links, {} healthy, {:.2} MB sent, {:.2} MB received",
-                                    link_stats.active_links, link_stats.healthy_links,
-                                    link_stats.total_bytes_sent as f64 / 1024.0 / 1024.0,
-                                    link_stats.total_bytes_received as f64 / 1024.0 / 1024.0
-                            );
-                        }
-                        
-                        for (link_id, link_stat) in &link_stats.link_stats {
-                            let success_rate = if link_stat.successful_sends > 0 {
-                                100.0 * link_stat.successful_sends as f64 / 
-                                (link_stat.successful_sends + link_stat.failed_sends) as f64
-                            } else { 0.0 };
-                            
-                            let health_icon = if link_stat.is_healthy { "✅" } else { "❌" };
-                            
-                            if use_color {
-                                println!("    {} Link {}: {} (success: {:.1}%, sent: {:.2} MB, recv: {:.2} MB)",
-                                        health_icon,
-                                        link_id.to_string().cyan(),
-                                        link_stat.remote_addr.to_string().yellow(),
-                                        success_rate,
-                                        link_stat.bytes_sent as f64 / 1024.0 / 1024.0,
-                                        link_stat.bytes_received as f64 / 1024.0 / 1024.0
-                                );
-                            } else {
-                                println!("    {} Link {}: {} (success: {:.1}%, sent: {:.2} MB, recv: {:.2} MB)",
-                                        health_icon, link_id, link_stat.remote_addr, success_rate,
-                                        link_stat.bytes_sent as f64 / 1024.0 / 1024.0,
-                                        link_stat.bytes_received as f64 / 1024.0 / 1024.0
-                                );
-                            }
-                        }
-                    }
-                }
+    // Create a listener for each address
+    for listen_addr in listen_addrs.clone() {
+        let target = target;
+        let control_tx = control_tx.clone();
+        let stats = stats.clone();
+        let handle = tokio::spawn(async move {
+            if let Err(e) = run_server_instance(listen_addr, target, control_tx, stats).await {
+                error!("Server instance {} failed: {}", listen_addr, e);
             }
         });
-
-        // Check if transparent proxy mode is enabled
-        if let (Some(proxy_port), Some(target)) = (self.proxy_port, self.target) {
-            let title = if use_color {
-                format!("{} Transparent Proxy: :{} -> {}", "🔀".blue(), proxy_port.to_string().cyan(), target.to_string().yellow())
-            } else {
-                format!("🔀 Transparent Proxy: :{} -> {}", proxy_port, target)
-            };
-            println!("{}", title);
-            
-            // Transparent proxy mode
-            self.run_transparent_proxy(manager, proxy_port, target, stats).await
-        } else {
-            print_status("Mode", "Test/Interactive", use_color);
-            // Test/interactive mode
-            self.run_test_mode(manager, stats).await
-        }
+        handles.push(handle);
     }
 
-    async fn run_transparent_proxy(
-        &self,
-        manager: UdpAggregationManager,
-        proxy_port: u16,
-        target: SocketAddr,
-        stats: Arc<ConnectionStats>,
-    ) -> Result<()> {
-        let use_color = stdout().is_tty();
-        
-        if use_color {
-            println!("{} Starting transparent proxy on {} -> {}", 
-                    "🌐".green(), 
-                    format!(":{}", proxy_port).cyan(), 
-                    target.to_string().yellow());
-        } else {
-            println!("🌐 Starting transparent proxy on :{} -> {}", proxy_port, target);
+    let title = format!("UDP Aggregation Server - {:?} -> {}", listen_addrs, target);
+
+    if no_monitor {
+        drop(control_rx);
+        eprintln!("{}", title);
+
+        // Wait for all instances
+        for handle in handles {
+            if let Err(e) = handle.await {
+                error!("Server handle failed: {}", e);
+            }
         }
+    } else {
+        eprintln!("{}", title.bold());
 
-        // Create session manager for client tracking
-        let session_manager = Arc::new(SessionManager::new(Duration::from_secs(self.session_timeout)));
-
-        // Bind proxy socket to listen for clients
-        let proxy_addr = SocketAddr::new("0.0.0.0".parse().unwrap(), proxy_port);
-        let proxy_socket = Arc::new(UdpSocket::bind(proxy_addr).await
-            .with_context(|| format!("Failed to bind proxy socket to {}", proxy_addr))?);
-
-        let local_addr = proxy_socket.local_addr()?;
-        if use_color {
-            println!("{} Proxy listening on {}", "👂".blue(), local_addr.to_string().green());
-            println!("{} Target service: {}", "🎯".blue(), target.to_string().yellow());
-        } else {
-            println!("👂 Proxy listening on {}", local_addr);
-            println!("🎯 Target service: {}", target);
-        }
-
-        // Clone for tasks
-        let proxy_socket_recv = proxy_socket.clone();
-        let session_manager_recv = session_manager.clone();
-
-        // Wrap manager in Arc for sharing
-        let manager = Arc::new(manager);
-
-        // Task 1: Forward client -> target (via aggregation)
-        let manager_send = manager.clone();
-        let stats_send = stats.clone();
-        let client_to_target = tokio::spawn(async move {
-            let mut buf = vec![0u8; 65536];
-            if use_color {
-                println!("{} Started client->target forwarding task", "📥".cyan());
-            } else {
-                println!("📥 Started client->target forwarding task");
-            }
-            
+        // Statistics task
+        let stats_clone = stats.clone();
+        let stats_control_tx = control_tx.clone();
+        let stats_task = tokio::spawn(async move {
+            let mut interval = interval(Duration::from_secs(1));
             loop {
-                match proxy_socket_recv.recv_from(&mut buf).await {
-                    Ok((len, client_addr)) => {
-                        let client_data = &buf[..len];
-                        debug!("📦 Received {} bytes from client {}", len, client_addr);
-                        stats_send.record_packet_received(len);
-
-                        // Generate UDP session ID based on the 5-tuple for consistent routing
-                        let session_id = SessionManager::generate_udp_session_id(
-                            client_addr,
-                            target,  // The target server address
-                            17  // UDP protocol number
-                        );
-                        debug!("🔑 Generated UDP session ID {} for flow {} -> {}", session_id, client_addr, target);
-
-                        // Store mapping for session tracking (for reverse path)
-                        session_manager_recv.get_or_create_session(client_addr);
-
-                        // Send directly via aggregation with session affinity (NO session packet wrapper needed)
-                        // The aggregation layer will automatically wrap data in UnorderedLinkMsg::Data
-                        match manager_send.send_data_with_session(client_data.to_vec(), session_id, Some(client_addr)).await {
-                            Ok(send_result) => {
-                                debug!("✅ Forwarded {} bytes (session {}) to target via aggregation link {}", 
-                                       send_result.bytes_sent, session_id, send_result.link_id);
-                                stats_send.record_packet_sent(send_result.bytes_sent);
-                            }
-                            Err(e) => {
-                                error!("❌ Failed to forward client data via aggregation: {}", e);
-                                stats_send.record_connection_error();
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!("❌ Proxy receive error: {}", e);
-                        stats_send.record_connection_error();
-                    }
-                }
+                interval.tick().await;
+                let packets = stats_clone.load(Ordering::Relaxed);
+                let status = format!("UDP Server - {} packets forwarded", packets);
+                let _ = stats_control_tx.send(status);
             }
         });
 
-        // Task 2: Forward target -> client (from aggregation)
-        let manager_recv = manager.clone();
-        let proxy_socket_send = proxy_socket.clone();
-        let session_manager_send = session_manager.clone();
-        let stats_recv = stats.clone();
-        
-        let target_to_client = tokio::spawn(async move {
-            if use_color {
-                println!("{} Started target->client forwarding task", "📤".cyan());
-            } else {
-                println!("📤 Started target->client forwarding task");
-            }
-            
-            // Get receiver for data coming back from aggregation
-            if let Some(mut receiver) = manager_recv.get_receiver().await {
-                if use_color {
-                    println!("{} Connected to aggregation receiver", "🔄".green());
-                } else {
-                    println!("🔄 Connected to aggregation receiver");
-                }
-                
-                while let Some(received_data) = receiver.recv().await {
-                    debug!("📨 Received {} bytes from aggregation on link {} (session: {})", 
-                           received_data.data.len(), received_data.link_id, received_data.session_id);
-                    stats_recv.record_packet_received(received_data.data.len());
-                    
-                    // Check if we have session information from UnorderedLinkMsg::Data
-                    if received_data.session_id != 0 && received_data.original_client.is_some() {
-                        // This is properly encapsulated multi-link data
-                        let client_addr = received_data.original_client.unwrap();
-                        let payload = &received_data.data;
-                        
-                        debug!("🎯 Forwarding {} bytes back to original client {} (session {})", 
-                               payload.len(), client_addr, received_data.session_id);
-                        
-                        // Send payload back to original client
-                        match proxy_socket_send.send_to(payload, client_addr).await {
-                            Ok(bytes_sent) => {
-                                debug!("✅ Successfully sent {} bytes back to client {} via multi-link aggregation", 
-                                       bytes_sent, client_addr);
-                                stats_recv.record_packet_sent(bytes_sent);
-                            }
-                            Err(e) => {
-                                error!("❌ Failed to send response back to client {}: {}", client_addr, e);
-                                stats_recv.record_connection_error();
-                            }
-                        }
-                    } else {
-                        // Fallback: try to parse as legacy session packet for backward compatibility
-                        if let Some(session_packet) = SessionPacket::new(&received_data.data) {
-                            if let Some(header) = session_packet.header() {
-                                let session_id = header.session_id;
-                                let payload = session_packet.payload();
-                                
-                                debug!("🔍 Parsed legacy session packet: session={}, payload={} bytes", session_id, payload.len());
-                                
-                                // Look up client address for this session
-                                if let Some(client_addr) = session_manager_send.get_client_addr(session_id) {
-                                    debug!("🎯 Forwarding {} bytes back to client {} (legacy session {})", 
-                                           payload.len(), client_addr, session_id);
-                                    
-                                    // Send payload back to client
-                                    match proxy_socket_send.send_to(payload, client_addr).await {
-                                        Ok(bytes_sent) => {
-                                            debug!("✅ Successfully sent {} bytes back to client {} (legacy mode)", 
-                                                   bytes_sent, client_addr);
-                                            stats_recv.record_packet_sent(bytes_sent);
-                                        }
-                                        Err(e) => {
-                                            error!("❌ Failed to send response back to client {}: {}", client_addr, e);
-                                            stats_recv.record_connection_error();
-                                        }
-                                    }
-                                } else {
-                                    warn!("⚠️  No client address found for legacy session {}", session_id);
-                                }
-                            } else {
-                                warn!("⚠️  Received data from aggregation without session header");
-                            }
-                        } else {
-                            warn!("⚠️  Received malformed session packet from aggregation");
-                        }
-                    }
-                }
-            } else {
-                print_error("Aggregation Receiver", "Failed to connect", use_color);
-                return;
-            }
-        });
-
-        // Task 3: Session cleanup
-        let session_cleanup = tokio::spawn(async move {
-            let mut cleanup_interval = interval(Duration::from_secs(30));
+        // Simple monitoring without interactive_monitor
+        let monitor_task = tokio::spawn(async move {
+            let mut control_rx = control_rx;
             loop {
-                cleanup_interval.tick().await;
-                let expired = session_manager.cleanup_expired_sessions();
-                if expired > 0 {
-                    if use_color {
-                        println!("{} Cleaned up {} expired sessions", "🧹".dim(), expired.to_string().dim());
-                    } else {
-                        println!("🧹 Cleaned up {} expired sessions", expired);
+                match control_rx.recv().await {
+                    Ok(status) => {
+                        eprintln!("{}", status);
                     }
+                    Err(_) => break,
                 }
             }
         });
 
-        // Wait for tasks
+        let server_task = tokio::spawn(async move {
+            // Wait for all instances
+            for handle in handles {
+                if let Err(e) = handle.await {
+                    error!("Server handle failed: {}", e);
+                }
+            }
+        });
+
         tokio::select! {
-            _ = client_to_target => {
-                print_error("Proxy", "Client-to-target task terminated", use_color);
-            }
-            _ = target_to_client => {
-                print_error("Proxy", "Target-to-client task terminated", use_color);
-            }
-            _ = session_cleanup => {
-                print_error("Proxy", "Session cleanup task terminated", use_color);
-            }
+            _ = stats_task => {},
+            _ = server_task => {},
+            _ = monitor_task => {},
         }
-
-        Ok(())
     }
 
-    async fn run_test_mode(&self, manager: UdpAggregationManager, stats: Arc<ConnectionStats>) -> Result<()> {
-        let use_color = stdout().is_tty();
-        
-        // Run client logic
-        if let Some(max_packets) = self.max_packets {
-            // Test mode with limited packets
-            print_status("Test Mode", &format!("Sending {} packets", max_packets), use_color);
-            
-            for i in 0..max_packets {
-                let data = format!("Test packet {} - {}", i, "x".repeat(self.packet_size.saturating_sub(50))).into_bytes();
-                
-                match manager.send_data(data.clone()).await {
-                    Ok(bytes_sent) => {
-                        debug!("Sent packet {}: {} bytes", i, bytes_sent);
-                        stats.record_packet_sent(bytes_sent);
-                    }
-                    Err(e) => {
-                        error!("Failed to send packet {}: {}", i, e);
-                        stats.record_connection_error();
-                    }
-                }
-
-                if self.rate > 0 {
-                    let delay = Duration::from_secs_f64(1.0 / self.rate as f64);
-                    sleep(delay).await;
-                }
-            }
-            print_success(&format!("Completed sending {} packets", max_packets), use_color);
-        } else {
-            // Interactive mode
-            print_status("Interactive Mode", "Client running (Press Ctrl+C to exit)", use_color);
-            
-            // For now, just keep running and report stats
-            let mut interval = interval(Duration::from_secs(30));
-            loop {
-                interval.tick().await;
-                let stats_result = manager.get_stats().await?;
-                
-                if use_color {
-                    println!("{} Client running with {} active links", "🏃".cyan(), stats_result.active_links.to_string().bold());
-                } else {
-                    println!("🏃 Client running with {} active links", stats_result.active_links);
-                }
-            }
-        }
-
-        Ok(())
-    }
+    Ok(())
 }
 
-impl ServerCli {
-    async fn run(self, stats_interval: u64, cfg_path: &Option<PathBuf>) -> Result<()> {
-        let use_color = stdout().is_tty();
-        let stats = Arc::new(ConnectionStats::new());
-        
-        print_status("UDP Aggregation Server", "Starting up", use_color);
+async fn run_server_instance(
+    listen_addr: SocketAddr, target: SocketAddr, control_tx: broadcast::Sender<String>, stats: Arc<AtomicU64>,
+) -> Result<()> {
+    let socket = Arc::new(UdpSocket::bind(listen_addr).await?);
+    info!("Server listening on {} -> {}", listen_addr, target);
 
-        // Load configuration from file if provided
-        let config = load_udp_config(cfg_path)?;
-        if cfg_path.is_some() {
-            print_status("Configuration", "Loaded from file", use_color);
-        }
+    // Create backend connection for forwarding
+    let backend_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+    backend_socket.connect(target).await?;
+    info!("Connected to backend {} from {}", target, backend_socket.local_addr()?);
 
-        // Create session manager for transparent proxy
-        let session_manager = Arc::new(SessionManager::new(Duration::from_secs(self.session_timeout)));
-        print_success("Session manager ready", use_color);
+    // Session tracking for server side
+    let sessions: Arc<RwLock<HashMap<SocketAddr, Instant>>> = Arc::new(RwLock::new(HashMap::new()));
+    let session_timeout = Duration::from_secs(60);
 
-        let mut servers = Vec::new();
-        let mut server_tasks = Vec::new();
+    // Client to backend forwarding task
+    let forward_socket = socket.clone();
+    let forward_backend = backend_socket.clone();
+    let forward_sessions = sessions.clone();
+    let forward_stats = stats.clone();
+    let forward_control_tx = control_tx.clone();
+    let forward_task = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65536];
+        let mut packet_count = 0u64;
 
-        // Bind to all specified listen addresses
-        if use_color {
-            println!("{} Binding to {} listen address(es):", "🔗".blue(), self.listen.len().to_string().bold());
-        } else {
-            println!("🔗 Binding to {} listen address(es):", self.listen.len());
-        }
-        
-        for (idx, listen_str) in self.listen.iter().enumerate() {
-            let listen_addr: SocketAddr = listen_str.parse()
-                .with_context(|| format!("Invalid listen address: {}", listen_str))?;
+        loop {
+            match forward_socket.recv_from(&mut buf).await {
+                Ok((len, proxy_addr)) => {
+                    packet_count += 1;
+                    forward_stats.fetch_add(1, Ordering::Relaxed);
 
-            if use_color {
-                println!("  [{}/{}] 📡 Binding to {}...", (idx + 1).to_string().cyan(), self.listen.len().to_string().cyan(), listen_addr.to_string().yellow());
-            } else {
-                println!("  [{}/{}] 📡 Binding to {}...", idx + 1, self.listen.len(), listen_addr);
-            }
+                    debug!(
+                        "Server {} received {} bytes from proxy {} (packet #{})",
+                        listen_addr, len, proxy_addr, packet_count
+                    );
 
-            match UdpSocket::bind(listen_addr).await {
-                Ok(socket) => {
-                    let actual_addr = socket.local_addr()?;
-                    if use_color {
-                        println!("  [{}/{}] ✅ Server listening on {}", (idx + 1).to_string().cyan(), self.listen.len().to_string().cyan(), actual_addr.to_string().green());
-                    } else {
-                        println!("  [{}/{}] ✅ Server listening on {}", idx + 1, self.listen.len(), actual_addr);
+                    // Update session
+                    {
+                        let mut sessions = forward_sessions.write().await;
+                        sessions.insert(proxy_addr, Instant::now());
                     }
-                    servers.push((socket, actual_addr));
-                }
-                Err(e) => {
-                    print_error(&format!("Bind to {}", listen_addr), &e.to_string(), use_color);
-                    return Err(e.into());
-                }
-            }
-        }
 
-        // Print server mode information
-        if self.echo {
-            print_status("Mode", "Echo mode enabled", use_color);
-        }
-        if let Some(forward_addr) = self.forward {
-            if use_color {
-                println!("{} Forward mode: {} -> {}", "🔀".blue(), "clients".cyan(), forward_addr.to_string().yellow());
-            } else {
-                println!("🔀 Forward mode: clients -> {}", forward_addr);
-            }
-        }
-
-        // Note: Server doesn't need its own aggregation manager for responses.
-        // Responses are sent back through the same UDP socket that received the request.
-
-        // Create a socket for communicating with the target service if in forward mode
-        let target_socket = if let Some(forward_addr) = self.forward {
-            match UdpSocket::bind("0.0.0.0:0").await {
-                Ok(target_socket) => {
-                    let local_addr = target_socket.local_addr()?;
-                    if use_color {
-                        println!("{} Target socket created: {} -> {}", "🎯".blue(), local_addr.to_string().dim(), forward_addr.to_string().yellow());
-                    } else {
-                        println!("🎯 Target socket created: {} -> {}", local_addr, forward_addr);
-                    }
-                    Some(Arc::new(target_socket))
-                }
-                Err(e) => {
-                    print_error("Target socket", &e.to_string(), use_color);
-                    return Err(e.into());
-                }
-            }
-        } else {
-            None
-        };
-
-        // Start server tasks for each listen address
-        for (idx, (socket, addr)) in servers.into_iter().enumerate() {
-            let echo = self.echo;
-            let forward = self.forward;
-            let session_manager = session_manager.clone();
-            let target_socket = target_socket.clone();
-            let stats_task = stats.clone();
-            let socket = Arc::new(socket);
-            
-            if use_color {
-                println!("{} Started server task {} for {}", "🚀".green(), (idx + 1).to_string().cyan(), addr.to_string().yellow());
-            } else {
-                println!("🚀 Started server task {} for {}", idx + 1, addr);
-            }
-            
-            let task = tokio::spawn(async move {
-                let mut buf = vec![0u8; 65536];
-                
-                loop {
-                    match socket.recv_from(&mut buf).await {
-                        Ok((len, from)) => {
-                            let data = &buf[..len];
-                            debug!("📦 Received {} bytes from {}", len, from);
-                            stats_task.record_packet_received(len);
-
-                            // Try to parse session packet
-                            if let Some(session_packet) = SessionPacket::new(data) {
-                                if let Some(header) = session_packet.header() {
-                                    // This is a session-tracked packet from aggregation client
-                                    let payload = session_packet.payload();
-                                    let session_id = header.session_id;
-                                    
-                                    debug!("🔍 Processing session packet: session_id={}, payload_len={}", 
-                                           session_id, payload.len());
-
-                                    // The session header contains CRC32 hash and port of the original client.
-                                    // We need to reconstruct the original client address for proper response routing.
-                                    // For now, we'll create a placeholder address and rely on session_id mapping.
-                                    let original_client_addr = SocketAddr::new(
-                                        "127.0.0.1".parse().unwrap(), 
-                                        header.client_port
-                                    );
-
-                                    // Remember complete session information for response routing
-                                    session_manager.remember_session_for_server(session_id, original_client_addr, from);
-                                    debug!("🔑 Stored session {} mapping: {} -> {} (via agg client {})", 
-                                           session_id, original_client_addr, addr, from);
-
-                                    if echo {
-                                        // For echo responses, use the original client address from the session
-                                        let echo_packet = SessionPacketBuilder::new(
-                                            session_id, 
-                                            original_client_addr,
-                                            payload.to_vec()
-                                        ).build();
-                                        
-                                        match socket.send_to(&echo_packet, from).await {
-                                            Ok(bytes_sent) => {
-                                                debug!("✅ Echoed session packet {} back to {}", session_id, from);
-                                                stats_task.record_packet_sent(bytes_sent);
-                                            }
-                                            Err(e) => {
-                                                error!("❌ Failed to echo session packet to {}: {}", from, e);
-                                                stats_task.record_connection_error();
-                                            }
-                                        }
-                                    }
-
-                                    if let (Some(forward_addr), Some(ref target_sock)) = (forward, &target_socket) {
-                                        // Forward payload (without session header) to destination
-                                        match target_sock.send_to(payload, forward_addr).await {
-                                            Ok(bytes_sent) => {
-                                                debug!("✅ Forwarded {} bytes (session {}) to {}", 
-                                                       bytes_sent, session_id, forward_addr);
-                                                stats_task.record_packet_sent(bytes_sent);
-                                            }
-                                            Err(e) => {
-                                                error!("❌ Failed to forward to {}: {}", forward_addr, e);
-                                                stats_task.record_connection_error();
-                                            }
-                                        }
-                                    }
-                                    
-                                    continue;
-                                }
-                            }
-
-                            // Handle regular packets (non-session)
-                            debug!("🔧 Handling regular (non-session) packet from {}", from);
-                            
-                            if echo {
-                                // Echo back to sender
-                                match socket.send_to(data, from).await {
-                                    Ok(bytes_sent) => {
-                                        debug!("✅ Echoed {} bytes back to {}", bytes_sent, from);
-                                        stats_task.record_packet_sent(bytes_sent);
-                                    }
-                                    Err(e) => {
-                                        error!("❌ Failed to echo to {}: {}", from, e);
-                                        stats_task.record_connection_error();
-                                    }
-                                }
-                            }
-
-                            if let (Some(forward_addr), Some(ref target_sock)) = (forward, &target_socket) {
-                                // Forward to destination
-                                match target_sock.send_to(data, forward_addr).await {
-                                    Ok(bytes_sent) => {
-                                        debug!("✅ Forwarded {} bytes to {}", bytes_sent, forward_addr);
-                                        stats_task.record_packet_sent(bytes_sent);
-                                    }
-                                    Err(e) => {
-                                        error!("❌ Failed to forward to {}: {}", forward_addr, e);
-                                        stats_task.record_connection_error();
-                                    }
-                                }
-                            }
+                    // Forward to backend
+                    match forward_backend.send(&buf[..len]).await {
+                        Ok(_) => {
+                            debug!("Forwarded {} bytes to backend {}", len, target);
                         }
                         Err(e) => {
-                            error!("❌ Server {} receive error: {}", addr, e);
-                            stats_task.record_connection_error();
+                            error!("Failed to forward to backend {}: {}", target, e);
                         }
                     }
-                }
-            });
-            
-            server_tasks.push(task);
-        }
 
-        // Start task to receive responses from target service and send back directly to clients
-        if let (Some(forward_addr), Some(target_sock)) = (self.forward, target_socket.clone()) {
-            
-            let session_mgr = session_manager.clone();
-            let stats_target = stats.clone();
-            
-            if use_color {
-                println!("{} Started target response listener for {}", "🔄".cyan(), forward_addr.to_string().yellow());
-            } else {
-                println!("🔄 Started target response listener for {}", forward_addr);
+                    // Send status update for monitoring
+                    if packet_count % 100 == 0 {
+                        let status = format!("{}: forwarded {} packets to backend", listen_addr, packet_count);
+                        let _ = forward_control_tx.send(status);
+                    }
+                }
+                Err(e) => {
+                    error!("Server {} receive error: {}", listen_addr, e);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
             }
-            
-            let target_response_task = tokio::spawn(async move {
-                let mut buf = vec![0u8; 65536];
-                
-                loop {
-                    match target_sock.recv_from(&mut buf).await {
-                        Ok((len, from)) => {
-                            if from == forward_addr {
-                                let response_data = &buf[..len];
-                                debug!("📨 Received {} bytes response from target {}", len, from);
-                                stats_target.record_packet_received(len);
-                                
-                                // Find active sessions and their aggregation clients
-                                let mut response_sent = false;
-                                
-                                for (session_id, agg_client_addr) in session_mgr.get_active_sessions() {
-                                    if let Some(original_client_addr) = session_mgr.get_original_client_addr(session_id) {
-                                        // Create response packet with session header
-                                        let response_packet = SessionPacketBuilder::new(
-                                            session_id,
-                                            original_client_addr,
-                                            response_data.to_vec()
-                                        ).build();
-                                        
-                                        // Send response directly back to the aggregation client via UDP
-                                        // The aggregation client will then route it to the original client
-                                        match target_sock.send_to(&response_packet, agg_client_addr).await {
-                                            Ok(bytes_sent) => {
-                                                debug!("✅ Sent {} bytes response to aggregation client {} for session {}", 
-                                                       bytes_sent, agg_client_addr, session_id);
-                                                stats_target.record_packet_sent(bytes_sent);
-                                                response_sent = true;
-                                                break; // Successfully sent, use only first session
-                                            }
-                                            Err(e) => {
-                                                error!("❌ Failed to send response to aggregation client {}: {}", agg_client_addr, e);
-                                            }
-                                        }
-                                    }
-                                }
-                                
-                                if !response_sent {
-                                    warn!("⚠️  Received response from target but no active sessions available for routing");
-                                    debug!("Response payload: {} bytes from {}", len, from);
-                                    stats_target.record_connection_error();
-                                }
+        }
+    });
+
+    // Backend to client response forwarding task
+    let response_socket = socket.clone();
+    let response_backend = backend_socket.clone();
+    let response_sessions = sessions.clone();
+    let response_task = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65536];
+
+        loop {
+            match response_backend.recv(&mut buf).await {
+                Ok(len) => {
+                    debug!("Received {} bytes response from backend {}", len, target);
+
+                    // Forward response to corresponding proxy clients
+                    let sessions = response_sessions.read().await;
+                    for (proxy_addr, last_seen) in sessions.iter() {
+                        if last_seen.elapsed() <= session_timeout {
+                            if let Err(e) = response_socket.send_to(&buf[..len], proxy_addr).await {
+                                debug!("Failed to send response to proxy {}: {}", proxy_addr, e);
                             } else {
-                                debug!("⚠️  Received unexpected response from {}, expected {}", from, forward_addr);
+                                debug!("Forwarded response to proxy {}", proxy_addr);
                             }
                         }
-                        Err(e) => {
-                            error!("❌ Target response receive error: {}", e);
-                            stats_target.record_connection_error();
-                            sleep(Duration::from_millis(100)).await;
-                        }
                     }
-                }
-            });
-            server_tasks.push(target_response_task);
-        }
-
-        // Session cleanup task
-        let session_manager_cleanup = session_manager.clone();
-        let session_cleanup = tokio::spawn(async move {
-            let mut cleanup_interval = interval(Duration::from_secs(30));
-            loop {
-                cleanup_interval.tick().await;
-                let expired = session_manager_cleanup.cleanup_expired_sessions();
-                if expired > 0 {
-                    if use_color {
-                        println!("{} Cleaned up {} expired sessions", "🧹".dim(), expired.to_string().dim());
-                    } else {
-                        println!("🧹 Cleaned up {} expired sessions", expired);
-                    }
-                }
-                
-                let session_stats = session_manager_cleanup.stats();
-                debug!("📊 Session stats: {} active sessions", session_stats.active_sessions);
-            }
-        });
-
-        // Statistics reporting
-        let server_count = self.listen.len();
-        let stats_clone = stats.clone();
-        tokio::spawn(async move {
-            let mut interval = interval(Duration::from_secs(stats_interval));
-            loop {
-                interval.tick().await;
-                
-                print_stats(&stats_clone, use_color);
-                
-                if use_color {
-                    println!("{} Server running with {} listeners", "🏃".cyan(), server_count.to_string().bold());
-                } else {
-                    println!("🏃 Server running with {} listeners", server_count);
-                }
-            }
-        });
-
-        // Print server ready message
-        if use_color {
-            println!("\n{} UDP Aggregation Server is ready!", "🌟".green().bold());
-            println!("{} Listening on {} address(es)", "📍".blue(), server_count.to_string().bold());
-            if self.echo {
-                println!("{} Echo mode: ON", "🔊".yellow());
-            }
-            if let Some(forward_addr) = self.forward {
-                println!("{} Forward mode: ON -> {}", "🔀".yellow(), forward_addr.to_string().cyan());
-            }
-            println!("{} Press Ctrl+C to stop", "💡".dim());
-        } else {
-            println!("\n🌟 UDP Aggregation Server is ready!");
-            println!("📍 Listening on {} address(es)", server_count);
-            if self.echo {
-                println!("🔊 Echo mode: ON");
-            }
-            if let Some(forward_addr) = self.forward {
-                println!("🔀 Forward mode: ON -> {}", forward_addr);
-            }
-            println!("💡 Press Ctrl+C to stop");
-        }
-
-        // Wait for all tasks
-        server_tasks.push(session_cleanup);
-        futures::future::try_join_all(server_tasks).await?;
-
-        Ok(())
-    }
-}
-
-impl TestCli {
-    async fn run(self, _stats_interval: u64, cfg_path: &Option<PathBuf>) -> Result<()> {
-        info!("Starting UDP aggregation performance test");
-
-        // Load configuration from file or use defaults with CLI overrides
-        let mut config = load_udp_config(cfg_path)?;
-
-        // Override load balancing strategy if specified via CLI
-        let load_balance = match self.load_balance.as_str() {
-            "round-robin" => LoadBalanceStrategy::RoundRobin,
-            "random" => LoadBalanceStrategy::Random,
-            "weighted" => LoadBalanceStrategy::WeightedByBandwidth,
-            "fastest" => LoadBalanceStrategy::FastestFirst,
-            _ => bail!("Invalid load balance strategy: {}", self.load_balance),
-        };
-        config.load_balance = load_balance;
-        
-        if cfg_path.is_some() {
-            info!("Configuration loaded from file");
-        }
-
-        // Create UDP aggregation manager
-        let manager = UdpAggregationManager::new(config).await
-            .context("Failed to create UDP aggregation manager")?;
-
-        // Connect to test servers
-        let mut link_id = 1u128;
-        for remote_str in &self.remote {
-            let remote_addr: SocketAddr = remote_str.parse()
-                .with_context(|| format!("Invalid remote address: {}", remote_str))?;
-
-            let transport = UdpTransport::connect(self.bind, remote_addr).await
-                .with_context(|| format!("Failed to connect to {}", remote_addr))?;
-
-            info!("Test link {} -> {}", transport.local_addr(), remote_addr);
-
-            manager.add_udp_link(LinkId(link_id), transport).await
-                .context("Failed to add UDP link to aggregation")?;
-
-            link_id += 1;
-        }
-
-        // Performance test
-        let test_data = vec![42u8; self.packet_size];
-        let test_duration = Duration::from_secs(self.duration);
-        let packet_interval = if self.rate > 0 {
-            Some(Duration::from_secs_f64(1.0 / self.rate as f64))
-        } else {
-            None
-        };
-
-        info!("Running performance test for {} seconds", self.duration);
-        info!("Packet size: {} bytes, Rate: {} pps", self.packet_size, if self.rate > 0 { self.rate.to_string() } else { "unlimited".to_string() });
-
-        let start_time = std::time::Instant::now();
-        let mut packets_sent = 0u64;
-        let mut bytes_sent = 0u64;
-
-        while start_time.elapsed() < test_duration {
-            match manager.send_data(test_data.clone()).await {
-                Ok(sent) => {
-                    packets_sent += 1;
-                    bytes_sent += sent as u64;
                 }
                 Err(e) => {
-                    error!("Send error: {}", e);
+                    error!("Failed to receive from backend {}: {}", target, e);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             }
-
-            if let Some(interval) = packet_interval {
-                sleep(interval).await;
-            }
         }
+    });
 
-        let elapsed = start_time.elapsed();
-        let final_stats = manager.get_stats().await?;
-
-        // Print test results
-        info!("=== Performance Test Results ===");
-        info!("Test Duration: {:.2}s", elapsed.as_secs_f64());
-        info!("Packets Sent: {}", packets_sent);
-        info!("Bytes Sent: {} ({:.2} MB)", bytes_sent, bytes_sent as f64 / 1_000_000.0);
-        info!("Packet Rate: {:.2} pps", packets_sent as f64 / elapsed.as_secs_f64());
-        info!("Throughput: {:.2} Mbps", (bytes_sent * 8) as f64 / elapsed.as_secs_f64() / 1_000_000.0);
-        info!("Active Links: {}", final_stats.active_links);
-        info!("Healthy Links: {}", final_stats.healthy_links);
-
-        for (link_id, link_stats) in &final_stats.link_stats {
-            info!(
-                "Link {}: sent={} bytes, success_rate={:.2}%",
-                link_id,
-                link_stats.bytes_sent,
-                if link_stats.successful_sends > 0 {
-                    100.0 * link_stats.successful_sends as f64 / 
-                    (link_stats.successful_sends + link_stats.failed_sends) as f64
-                } else { 0.0 }
-            );
+    // Session cleanup task
+    let cleanup_sessions = sessions.clone();
+    let cleanup_task = tokio::spawn(async move {
+        let mut interval = interval(Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            let mut sessions = cleanup_sessions.write().await;
+            sessions.retain(|_, last_seen| last_seen.elapsed() <= session_timeout);
+            debug!("Server {}: Active sessions: {}", listen_addr, sessions.len());
         }
+    });
 
-        Ok(())
+    tokio::select! {
+        _ = forward_task => {},
+        _ = response_task => {},
+        _ = cleanup_task => {},
     }
+
+    Ok(())
 }

@@ -8,7 +8,10 @@
 use byteorder::{ReadBytesExt, WriteBytesExt, BE};
 use std::io;
 
-use crate::{id::LinkId, unordered_cfg::UnorderedCfg};
+use crate::{
+    id::LinkId,
+    unordered_cfg::{NodeRole, UnorderedCfg},
+};
 
 /// Unordered link message types.
 ///
@@ -123,7 +126,7 @@ pub enum LinkStatus {
 
 impl UnorderedLinkMsg {
     /// Protocol version for unordered aggregation.
-    pub const PROTOCOL_VERSION: u8 = 1;
+    pub const PROTOCOL_VERSION: u8 = 2;
 
     /// Magic identifier for unordered aggregation.
     const MAGIC: &'static [u8; 5] = b"UAGG\0";
@@ -419,11 +422,11 @@ impl UnorderedCfg {
         writer.write_u32::<BE>(self.recv_queue.get() as u32)?;
 
         let strategy_code = match self.load_balance {
-            crate::unordered_cfg::LoadBalanceStrategy::RoundRobin => 1,
-            crate::unordered_cfg::LoadBalanceStrategy::PacketRoundRobin => 2,
-            crate::unordered_cfg::LoadBalanceStrategy::WeightedByBandwidth => 3,
-            crate::unordered_cfg::LoadBalanceStrategy::FastestFirst => 4,
-            crate::unordered_cfg::LoadBalanceStrategy::Random => 5,
+            crate::unordered_cfg::LoadBalanceStrategy::PacketRoundRobin => 1,
+            crate::unordered_cfg::LoadBalanceStrategy::WeightedByBandwidth => 2,
+            crate::unordered_cfg::LoadBalanceStrategy::FastestFirst => 3,
+            crate::unordered_cfg::LoadBalanceStrategy::WeightedByPacketLoss => 4,
+            crate::unordered_cfg::LoadBalanceStrategy::DynamicAdaptive => 5,
         };
         writer.write_u8(strategy_code)?;
 
@@ -436,6 +439,14 @@ impl UnorderedCfg {
         for interval in &self.stats_intervals {
             writer.write_u64::<BE>(interval.as_millis() as u64)?;
         }
+
+        // Write node_role
+        let role_code = match self.node_role {
+            NodeRole::Client => 1,
+            NodeRole::Server => 2,
+            NodeRole::Balanced => 3,
+        };
+        writer.write_u8(role_code)?;
 
         Ok(())
     }
@@ -452,11 +463,11 @@ impl UnorderedCfg {
 
         let strategy_code = reader.read_u8()?;
         let load_balance = match strategy_code {
-            1 => crate::unordered_cfg::LoadBalanceStrategy::RoundRobin,
-            2 => crate::unordered_cfg::LoadBalanceStrategy::PacketRoundRobin,
-            3 => crate::unordered_cfg::LoadBalanceStrategy::WeightedByBandwidth,
-            4 => crate::unordered_cfg::LoadBalanceStrategy::FastestFirst,
-            5 => crate::unordered_cfg::LoadBalanceStrategy::Random,
+            1 => crate::unordered_cfg::LoadBalanceStrategy::PacketRoundRobin,
+            2 => crate::unordered_cfg::LoadBalanceStrategy::WeightedByBandwidth,
+            3 => crate::unordered_cfg::LoadBalanceStrategy::FastestFirst,
+            4 => crate::unordered_cfg::LoadBalanceStrategy::WeightedByPacketLoss,
+            5 => crate::unordered_cfg::LoadBalanceStrategy::DynamicAdaptive,
             _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown load balance strategy")),
         };
 
@@ -473,6 +484,15 @@ impl UnorderedCfg {
             stats_intervals.push(interval);
         }
 
+        // Read node_role
+        let role_code = reader.read_u8()?;
+        let node_role = match role_code {
+            1 => NodeRole::Client,
+            2 => NodeRole::Server,
+            3 => NodeRole::Balanced,
+            _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid node_role")),
+        };
+
         Ok(UnorderedCfg {
             send_queue,
             recv_queue,
@@ -482,6 +502,7 @@ impl UnorderedCfg {
             max_packet_size,
             connect_queue,
             stats_intervals,
+            node_role,
         })
     }
 }

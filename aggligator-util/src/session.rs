@@ -196,10 +196,7 @@ impl SessionManager {
     /// Remember complete session information for server-side response routing
     /// This tracks session_id -> (original_client_addr, aggregation_client_addr)
     pub fn remember_session_for_server(
-        &self,
-        session_id: SessionId,
-        original_client_addr: SocketAddr,
-        agg_client_addr: SocketAddr,
+        &self, session_id: SessionId, original_client_addr: SocketAddr, agg_client_addr: SocketAddr,
     ) {
         // Store the aggregation client mapping for response routing
         self.session_to_agg_client.insert(session_id, agg_client_addr);

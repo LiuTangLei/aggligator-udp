@@ -5,6 +5,151 @@
 //! strict ordering guarantees. This is suitable for protocols like
 //! UDP, QUIC, WebRTC, and other scenarios where the application
 //! layer handles ordering and reliability.
+//!
+//! # Example Usage
+//!
+//! ```rust
+//! use aggligator::unordered_cfg::{UnorderedCfg, LoadBalanceStrategy};
+//! use aggligator::unordered_task::{UnorderedAggManager, HealthCheckConfig};
+//! use tokio::sync::mpsc;
+//! use std::time::Duration;
+//!
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! // Create configuration for high-performance UDP aggregation
+//! let config = UnorderedCfg {
+//!     load_balance: LoadBalanceStrategy::PacketRoundRobin,
+//!     max_bandwidth_mbps: Some(1000), // 1 Gbps total
+//!     enable_jitter_control: true,
+//!     max_jitter_ms: 5,
+//!     ..Default::default()
+//! };
+//!
+//! // Set up channels for data forwarding
+//! let (tx_rx, mut data_receiver) = mpsc::unbounded_channel();
+//! let (tx_control, rx_control) = mpsc::unbounded_channel();
+//!
+//! // Create and start the aggregation manager
+//! let manager = UnorderedAggManager::new(config, tx_rx, tx_control);
+//!
+//! // Start the aggregation task
+//! tokio::spawn(async move {
+//!     manager.get_task().run(rx_control).await
+//! });
+//!
+//! // Add links (transport implementations would be provided by transport crates)
+//! // manager.add_link(link_id1, udp_transport1).await?;
+//! // manager.add_link(link_id2, quic_transport2).await?;
+//!
+//! // Send data through aggregated links
+//! let data = b"Hello, aggregated world!".to_vec();
+//! // manager.send_data(data).await?;
+//!
+//! // Receive aggregated data
+//! while let Some(received) = data_receiver.recv().await {
+//!     println!("Received {} bytes", received.data.len());
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Configuration Options
+//!
+//! The `UnorderedCfg` struct provides several options for tuning the
+//! behavior of the unordered aggregation, including:
+//!
+//! - `send_queue` / `recv_queue`: Sizes of the send and receive queues.
+//! - `load_balance`: Strategy for distributing packets across links.
+//! - `heartbeat_interval` / `link_timeout`: Parameters for link health detection.
+//! - `max_packet_size`: Maximum size of a single packet.
+//! - `connect_queue`: Queue length for establishing new connections.
+//! - `stats_intervals`: Intervals for calculating link speed statistics.
+//!
+//! ## Load Balancing Strategies
+//!
+//! The `LoadBalanceStrategy` enum defines several strategies for load
+//! balancing across multiple links:
+//!
+//! - `PacketRoundRobin`: Round-robin at the packet level, allowing single UDP flows to use multiple links.
+//! - `WeightedByBandwidth`: Distributes packets based on the bandwidth of each link.
+//! - `FastestFirst`: Always uses the fastest (lowest latency) link available.
+//! - `WeightedByPacketLoss`: Distributes packets based on packet loss rates, favoring reliable links.
+//! - `DynamicAdaptive`: Advanced adaptive strategy combining bandwidth, packet loss, and exploration for optimal performance.
+//!
+//! ## Heartbeat and Timeout
+//!
+//! The `heartbeat_interval` and `link_timeout` fields in the configuration
+//! control how the system detects and responds to link failures. The
+//! heartbeat interval determines how often heartbeat packets are sent,
+//! while the link timeout determines how long to wait for a heartbeat
+//! response before considering the link as failed.
+//!
+//! ## Packet Size and Queues
+//!
+//! The `max_packet_size` field should be set according to the Maximum
+//! Transmission Unit (MTU) of the network to avoid packet fragmentation.
+//! The send and receive queues (`send_queue` and `recv_queue`) control
+//! how many packets can be queued for sending and receiving, respectively.
+//!
+//! ## Statistics and Monitoring
+//!
+//! The `stats_intervals` field allows the configuration of multiple
+//! intervals for monitoring link performance. These intervals are used
+//! to calculate throughput statistics, which can inform load balancing
+//! decisions.
+//!
+//! # Example
+//!
+//! Here is a more complete example demonstrating the usage of the
+//! configuration and the aggregation manager:
+//!
+//! ```rust
+//! use aggligator::unordered_cfg::{UnorderedCfg, LoadBalanceStrategy};
+//! use aggligator::unordered_task::{UnorderedAggManager, HealthCheckConfig};
+//! use tokio::sync::mpsc;
+//! use std::time::Duration;
+//!
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! // Create configuration for high-performance UDP aggregation
+//! let config = UnorderedCfg {
+//!     load_balance: LoadBalanceStrategy::PacketRoundRobin,
+//!     max_bandwidth_mbps: Some(1000), // 1 Gbps total
+//!     enable_jitter_control: true,
+//!     max_jitter_ms: 5,
+//!     ..Default::default()
+//! };
+//!
+//! // Set up channels for data forwarding
+//! let (tx_rx, mut data_receiver) = mpsc::unbounded_channel();
+//! let (tx_control, rx_control) = mpsc::unbounded_channel();
+//!
+//! // Create and start the aggregation manager
+//! let manager = UnorderedAggManager::new(config, tx_rx, tx_control);
+//!
+//! // Start the aggregation task
+//! tokio::spawn(async move {
+//!     manager.get_task().run(rx_control).await
+//! });
+//!
+//! // Add links (transport implementations would be provided by transport crates)
+//! // manager.add_link(link_id1, udp_transport1).await?;
+//! // manager.add_link(link_id2, quic_transport2).await?;
+//!
+//! // Send data through aggregated links
+//! let data = b"Hello, aggregated world!".to_vec();
+//! // manager.send_data(data).await?;
+//!
+//! // Receive aggregated data
+//! while let Some(received) = data_receiver.recv().await {
+//!     println!("Received {} bytes", received.data.len());
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! This example demonstrates creating a configuration for high-performance
+//! UDP aggregation, setting up the necessary channels, creating and starting
+//! the aggregation manager, and finally sending and receiving data through
+//! the aggregated links.
 
 use std::{num::NonZeroUsize, time::Duration};
 
@@ -12,19 +157,31 @@ use std::{num::NonZeroUsize, time::Duration};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "dump", derive(serde::Serialize, serde::Deserialize))]
 pub enum LoadBalanceStrategy {
-    /// Round-robin distribution across all active links.
-    /// Uses session affinity - same session always uses same link.
-    RoundRobin,
     /// Packet-level round-robin without session affinity.
     /// Each packet is distributed to links in round-robin fashion,
     /// allowing single UDP flows to use multiple links for bandwidth aggregation.
     PacketRoundRobin,
     /// Weighted distribution based on link bandwidth.
+    /// Always selects the link with highest available bandwidth.
     WeightedByBandwidth,
     /// Always use the fastest (lowest latency) link first.
+    /// Prioritizes latency over bandwidth utilization.
     FastestFirst,
-    /// Random distribution for load spreading.
-    Random,
+    /// Weighted distribution based on packet loss rate.
+    /// Links with lower packet loss get higher weight.
+    /// This strategy monitors packet loss rates and automatically
+    /// reduces traffic to lossy links while favoring reliable ones.
+    WeightedByPacketLoss,
+    /// Dynamic adaptive distribution with automatic weight recovery.
+    /// Uses sliding window statistics and includes exploration mechanism
+    /// to prevent links from being permanently marginalized due to temporary issues.
+    /// Features:
+    /// - Sliding window packet loss and bandwidth tracking
+    /// - Minimum exploration weight (prevents total exclusion)
+    /// - Dynamic weight adjustment based on recent performance
+    /// - Automatic recovery when link conditions improve
+    /// - Weighted random selection for optimal load balancing
+    DynamicAdaptive,
 }
 
 impl Default for LoadBalanceStrategy {
@@ -32,6 +189,18 @@ impl Default for LoadBalanceStrategy {
         // Use PacketRoundRobin by default for true bandwidth aggregation
         Self::PacketRoundRobin
     }
+}
+
+/// Role of the node in aggregation (affects bandwidth priority)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "dump", derive(serde::Serialize, serde::Deserialize))]
+pub enum NodeRole {
+    /// Client role - prioritizes receiving bandwidth (download speed)
+    Client,
+    /// Server role - prioritizes sending bandwidth (upload speed)
+    Server,
+    /// Balanced role - considers both directions equally
+    Balanced,
 }
 
 /// Configuration for unordered link aggregation.
@@ -47,14 +216,26 @@ pub struct UnorderedCfg {
     ///
     /// This controls how many packets can be queued for sending
     /// when links are temporarily unavailable.
-    #[cfg_attr(feature = "dump", serde(serialize_with = "serde_helpers::serialize_nonzero_usize", deserialize_with = "serde_helpers::deserialize_nonzero_usize"))]
+    #[cfg_attr(
+        feature = "dump",
+        serde(
+            serialize_with = "serde_helpers::serialize_nonzero_usize",
+            deserialize_with = "serde_helpers::deserialize_nonzero_usize"
+        )
+    )]
     pub send_queue: NonZeroUsize,
 
     /// Length of queue for received data packets.
     ///
     /// This controls how many packets can be buffered on the
     /// receive side before backpressure is applied.
-    #[cfg_attr(feature = "dump", serde(serialize_with = "serde_helpers::serialize_nonzero_usize", deserialize_with = "serde_helpers::deserialize_nonzero_usize"))]
+    #[cfg_attr(
+        feature = "dump",
+        serde(
+            serialize_with = "serde_helpers::serialize_nonzero_usize",
+            deserialize_with = "serde_helpers::deserialize_nonzero_usize"
+        )
+    )]
     pub recv_queue: NonZeroUsize,
 
     /// Load balancing strategy for distributing packets across links.
@@ -63,14 +244,26 @@ pub struct UnorderedCfg {
     /// Interval for sending heartbeat packets to detect link health.
     ///
     /// Shorter intervals provide faster failure detection but increase overhead.
-    #[cfg_attr(feature = "dump", serde(serialize_with = "serde_helpers::serialize_duration", deserialize_with = "serde_helpers::deserialize_duration"))]
+    #[cfg_attr(
+        feature = "dump",
+        serde(
+            serialize_with = "serde_helpers::serialize_duration",
+            deserialize_with = "serde_helpers::deserialize_duration"
+        )
+    )]
     pub heartbeat_interval: Duration,
 
     /// Timeout for considering a link as failed.
     ///
     /// If no heartbeat response is received within this timeout,
     /// the link is considered failed and removed from rotation.
-    #[cfg_attr(feature = "dump", serde(serialize_with = "serde_helpers::serialize_duration", deserialize_with = "serde_helpers::deserialize_duration"))]
+    #[cfg_attr(
+        feature = "dump",
+        serde(
+            serialize_with = "serde_helpers::serialize_duration",
+            deserialize_with = "serde_helpers::deserialize_duration"
+        )
+    )]
     pub link_timeout: Duration,
 
     /// Maximum size of a single packet.
@@ -80,15 +273,35 @@ pub struct UnorderedCfg {
     pub max_packet_size: usize,
 
     /// Queue length for establishing new connections.
-    #[cfg_attr(feature = "dump", serde(serialize_with = "serde_helpers::serialize_nonzero_usize", deserialize_with = "serde_helpers::deserialize_nonzero_usize"))]
+    #[cfg_attr(
+        feature = "dump",
+        serde(
+            serialize_with = "serde_helpers::serialize_nonzero_usize",
+            deserialize_with = "serde_helpers::deserialize_nonzero_usize"
+        )
+    )]
     pub connect_queue: NonZeroUsize,
 
     /// Link speed statistics interval durations.
     ///
     /// These intervals are used to calculate throughput statistics
     /// for load balancing decisions.
-    #[cfg_attr(feature = "dump", serde(serialize_with = "serde_helpers::serialize_duration_vec", deserialize_with = "serde_helpers::deserialize_duration_vec"))]
+    #[cfg_attr(
+        feature = "dump",
+        serde(
+            serialize_with = "serde_helpers::serialize_duration_vec",
+            deserialize_with = "serde_helpers::deserialize_duration_vec"
+        )
+    )]
     pub stats_intervals: Vec<Duration>,
+
+    /// Node role for directional bandwidth prioritization.
+    ///
+    /// This affects how DynamicAdaptive strategy weighs send vs receive bandwidth:
+    /// - Client: prioritizes receive bandwidth (download speed)
+    /// - Server: prioritizes send bandwidth (upload speed)
+    /// - Balanced: considers both directions equally
+    pub node_role: NodeRole,
 }
 
 impl Default for UnorderedCfg {
@@ -121,6 +334,9 @@ impl Default for UnorderedCfg {
                 Duration::from_secs(1),     // 1s for short-term trends
                 Duration::from_secs(10),    // 10s for medium-term trends
             ],
+
+            // Default to balanced role
+            node_role: NodeRole::Balanced,
         }
     }
 }
@@ -164,7 +380,7 @@ impl UnorderedCfg {
     /// for better resilience in unstable network conditions.
     pub fn unreliable_network() -> Self {
         Self {
-            load_balance: LoadBalanceStrategy::Random, // Spread load to avoid hotspots
+            load_balance: LoadBalanceStrategy::DynamicAdaptive, // Smart adaptation to unreliable conditions
             heartbeat_interval: Duration::from_millis(50),
             link_timeout: Duration::from_millis(150),
             max_packet_size: 1200, // Conservative to reduce loss
@@ -234,7 +450,7 @@ mod tests {
 
 #[cfg(feature = "dump")]
 mod serde_helpers {
-    use serde::{Deserialize, Serialize, Deserializer, Serializer};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::num::NonZeroUsize;
     use std::time::Duration;
 

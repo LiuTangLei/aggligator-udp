@@ -10,13 +10,16 @@
 //! `aggligator-transport-quic`, etc.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fmt,
-    sync::{Arc, atomic::{AtomicU64, Ordering}},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, oneshot, RwLock};
-use tracing::{debug, info, warn, error, trace};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::{
     id::LinkId,
@@ -30,43 +33,43 @@ pub enum UnorderedAggError {
     /// No links are available for sending data
     NoLinksAvailable,
     /// No healthy links are available
-    NoHealthyLinks { 
+    NoHealthyLinks {
         /// Total number of links available
-        total_links: usize 
+        total_links: usize,
     },
     /// Specific link not found
-    LinkNotFound { 
+    LinkNotFound {
         /// The link ID that was not found
-        link_id: LinkId 
+        link_id: LinkId,
     },
     /// Link is unhealthy
-    LinkUnhealthy { 
+    LinkUnhealthy {
         /// The unhealthy link ID
-        link_id: LinkId 
+        link_id: LinkId,
     },
     /// Network I/O error
-    NetworkError { 
+    NetworkError {
         /// Optional link ID where error occurred
-        link_id: Option<LinkId>, 
+        link_id: Option<LinkId>,
         /// The underlying I/O error
-        source: std::io::Error 
+        source: std::io::Error,
     },
     /// Control channel closed or send error
     ChannelClosed {
         /// Context for the channel error
-        context: String
+        context: String,
     },
     /// Control operation timeout or receive error
-    TimeoutOrRecvError { 
+    TimeoutOrRecvError {
         /// Description of the operation that timed out or failed
-        operation: String 
+        operation: String,
     },
     /// Internal error with context
-    Internal { 
+    Internal {
         /// Context information about where the error occurred
-        context: String, 
+        context: String,
         /// Optional underlying error
-        source: Option<Box<dyn std::error::Error + Send + Sync>> 
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
     },
 }
 
@@ -85,24 +88,20 @@ impl fmt::Display for UnorderedAggError {
             UnorderedAggError::LinkUnhealthy { link_id } => {
                 write!(f, "Link {} is unhealthy", link_id)
             }
-            UnorderedAggError::NetworkError { link_id, source } => {
-                match link_id {
-                    Some(id) => write!(f, "Network error on link {}: {}", id, source),
-                    None => write!(f, "Network error: {}", source),
-                }
-            }
+            UnorderedAggError::NetworkError { link_id, source } => match link_id {
+                Some(id) => write!(f, "Network error on link {}: {}", id, source),
+                None => write!(f, "Network error: {}", source),
+            },
             UnorderedAggError::ChannelClosed { context } => {
                 write!(f, "Control channel operation failed (channel closed or send error): {}", context)
             }
             UnorderedAggError::TimeoutOrRecvError { operation } => {
                 write!(f, "Operation '{}' timed out or failed to receive response", operation)
             }
-            UnorderedAggError::Internal { context, source } => {
-                match source {
-                    Some(e) => write!(f, "Internal error in {}: {}", context, e),
-                    None => write!(f, "Internal error in {}", context),
-                }
-            }
+            UnorderedAggError::Internal { context, source } => match source {
+                Some(e) => write!(f, "Internal error in {}: {}", context, e),
+                None => write!(f, "Internal error in {}", context),
+            },
         }
     }
 }
@@ -150,23 +149,23 @@ pub struct SendResult {
 pub trait UnorderedLinkTransport: Send + Sync + std::fmt::Debug + 'static {
     /// Send raw data through this transport link (low-level interface)
     async fn send_raw(&self, data: &[u8]) -> Result<usize, std::io::Error>;
-    
+
     /// Send data with session information (high-level interface)
     /// This will automatically wrap the data in UnorderedLinkMsg::Data
     async fn send(&self, data: &[u8]) -> Result<usize, std::io::Error> {
         // Generate a session ID based on data hash for session consistency
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
-        
+
         let mut hasher = DefaultHasher::new();
         data.hash(&mut hasher);
         let session_id = hasher.finish();
-        
+
         // Use send_with_session with auto-generated session ID
         // This ensures all data is properly wrapped in UnorderedLinkMsg::Data
         self.send_with_session(data, LinkId(0), session_id, None).await
     }
-    
+
     /// Send data through aggregation (compatibility method)
     /// This method is used by the aggregation task to send data
     async fn send_data(&self, data: &[u8]) -> Result<usize, std::io::Error> {
@@ -174,36 +173,25 @@ pub trait UnorderedLinkTransport: Send + Sync + std::fmt::Debug + 'static {
         // This replaces the old direct send_raw() call
         self.send(data).await
     }
-    
+
     /// Send data with full session context (for transparent proxy)
     async fn send_with_session(
-        &self,
-        data: &[u8],
-        link_id: LinkId,
-        session_id: u64,
-        original_client: Option<std::net::SocketAddr>,
+        &self, data: &[u8], link_id: LinkId, session_id: u64, original_client: Option<std::net::SocketAddr>,
     ) -> Result<usize, std::io::Error> {
         // Create wrapped message
-        let msg = UnorderedLinkMsg::Data {
-            link_id,
-            session_id,
-            original_client,
-            payload: data.to_vec(),
-        };
-        
+        let msg = UnorderedLinkMsg::Data { link_id, session_id, original_client, payload: data.to_vec() };
+
         // Serialize message
         let mut buf = Vec::new();
-        msg.write(&mut buf).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-        })?;
-        
+        msg.write(&mut buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
         // Send serialized message
         self.send_raw(&buf).await
     }
-    
+
     /// Get the remote address as a string for identification
     fn remote_addr(&self) -> String;
-    
+
     /// Check if the link is healthy
     async fn is_healthy(&self) -> bool {
         true // Default implementation
@@ -225,8 +213,14 @@ pub struct UnorderedLinkState {
     pub bytes_sent: Arc<AtomicU64>,
     /// Number of bytes received from this link
     pub bytes_received: Arc<AtomicU64>,
+    /// Number of successful send operations
+    pub successful_sends: Arc<AtomicU64>,
+    /// Number of failed send operations
+    pub failed_sends: Arc<AtomicU64>,
     /// Whether this link is considered healthy
     pub is_healthy: bool,
+    /// 滑动窗口性能统计
+    pub windowed_stats: Arc<RwLock<WindowedStats>>,
 }
 
 impl UnorderedLinkState {
@@ -240,18 +234,75 @@ impl UnorderedLinkState {
             last_seen: Instant::now(),
             bytes_sent: Arc::new(AtomicU64::new(0)),
             bytes_received: Arc::new(AtomicU64::new(0)),
+            successful_sends: Arc::new(AtomicU64::new(0)),
+            failed_sends: Arc::new(AtomicU64::new(0)),
             is_healthy: true,
+            windowed_stats: Arc::new(RwLock::new(WindowedStats::new(Duration::from_secs(60)))),
         }
     }
 
     /// Update statistics for sent data
-    pub fn record_sent(&self, bytes: usize) {
+    pub async fn record_sent(&self, bytes: usize) {
         self.bytes_sent.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.successful_sends.fetch_add(1, Ordering::Relaxed);
+
+        // Update sliding window stats
+        let mut windowed_stats = self.windowed_stats.write().await;
+        windowed_stats.add_record(1, 0, bytes as u64);
     }
 
     /// Update statistics for received data
     pub fn record_received(&self, bytes: usize) {
         self.bytes_received.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// Record a failed send operation
+    pub async fn record_send_failure(&self) {
+        self.failed_sends.fetch_add(1, Ordering::Relaxed);
+
+        // Update sliding window stats
+        let mut windowed_stats = self.windowed_stats.write().await;
+        windowed_stats.add_record(0, 1, 0);
+    }
+
+    /// Calculate packet loss rate (0.0 to 1.0)
+    pub fn packet_loss_rate(&self) -> f64 {
+        let successful = self.successful_sends.load(Ordering::Relaxed);
+        let failed = self.failed_sends.load(Ordering::Relaxed);
+        let total = successful + failed;
+
+        if total == 0 {
+            0.0
+        } else {
+            failed as f64 / total as f64
+        }
+    }
+
+    /// Get quality score (combines bandwidth and packet loss)
+    /// Higher score means better quality
+    pub fn quality_score(&self, bandwidth: f64) -> f64 {
+        let loss_rate = self.packet_loss_rate();
+        // Quality = bandwidth * (1 - loss_rate)^2
+        // Square the loss penalty to heavily penalize lossy links
+        bandwidth * (1.0 - loss_rate).powi(2)
+    }
+
+    /// Get windowed packet loss rate using sliding window statistics
+    pub async fn windowed_packet_loss_rate(&self) -> f64 {
+        let mut windowed_stats = self.windowed_stats.write().await;
+        windowed_stats.windowed_packet_loss_rate()
+    }
+
+    /// Get windowed send speed using sliding window statistics
+    pub async fn windowed_send_speed(&self) -> f64 {
+        let mut windowed_stats = self.windowed_stats.write().await;
+        windowed_stats.windowed_send_speed()
+    }
+
+    /// Calculate dynamic weight with exploration mechanism
+    pub async fn dynamic_weight(&self, base_bandwidth: f64) -> f64 {
+        let mut windowed_stats = self.windowed_stats.write().await;
+        windowed_stats.dynamic_weight(base_bandwidth)
     }
 }
 
@@ -266,16 +317,16 @@ pub enum UnorderedControlMsg {
         transport: Arc<dyn UnorderedLinkTransport>,
     },
     /// Remove a link
-    RemoveLink { 
+    RemoveLink {
         /// Link identifier
-        link_id: LinkId 
+        link_id: LinkId,
     },
     /// Update link health status
-    UpdateLinkHealth { 
+    UpdateLinkHealth {
         /// Link identifier
-        link_id: LinkId, 
+        link_id: LinkId,
         /// Whether the link is healthy
-        is_healthy: bool 
+        is_healthy: bool,
     },
     /// Get aggregation statistics
     GetStats {
@@ -345,27 +396,14 @@ pub struct ReceivedData {
 impl ReceivedData {
     /// Create new received data without session information
     pub fn new(data: Vec<u8>, link_id: LinkId) -> Self {
-        Self {
-            data,
-            link_id,
-            session_id: 0,
-            original_client: None,
-        }
+        Self { data, link_id, session_id: 0, original_client: None }
     }
-    
+
     /// Create new received data with session information
     pub fn with_session(
-        data: Vec<u8>, 
-        link_id: LinkId, 
-        session_id: u64, 
-        original_client: Option<std::net::SocketAddr>
+        data: Vec<u8>, link_id: LinkId, session_id: u64, original_client: Option<std::net::SocketAddr>,
     ) -> Self {
-        Self {
-            data,
-            link_id,
-            session_id,
-            original_client,
-        }
+        Self { data, link_id, session_id, original_client }
     }
 }
 
@@ -427,8 +465,7 @@ pub struct UnorderedAggTask {
 impl UnorderedAggTask {
     /// Create a new unordered aggregation task
     pub fn new(
-        config: UnorderedCfg,
-        rx_channel: mpsc::UnboundedSender<ReceivedData>,
+        config: UnorderedCfg, rx_channel: mpsc::UnboundedSender<ReceivedData>,
         control_tx: mpsc::UnboundedSender<UnorderedControlMsg>,
     ) -> Self {
         Self {
@@ -436,14 +473,13 @@ impl UnorderedAggTask {
             rx_channel,
             control_tx,
             links: Arc::new(RwLock::new(HashMap::new())),
-            load_balancer: UnorderedLoadBalancer::new(config.load_balance),
+            load_balancer: UnorderedLoadBalancer::new(config.load_balance, config.node_role),
         }
     }
 
     /// Start the aggregation task
     pub async fn run(
-        &self,
-        mut control_rx: mpsc::UnboundedReceiver<UnorderedControlMsg>,
+        &self, mut control_rx: mpsc::UnboundedReceiver<UnorderedControlMsg>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         loop {
             tokio::select! {
@@ -501,36 +537,32 @@ impl UnorderedAggTask {
     pub async fn send(&self, data: Vec<u8>) -> Result<(), std::io::Error> {
         let links = self.links.read().await;
         if links.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "No links available"
-            ));
+            return Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "No links available"));
         }
 
         let link_id = match self.load_balancer.select_link(&links).await {
             Some(id) => id,
-            None => return Err(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "No links available for selection"
-            )),
+            None => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "No links available for selection",
+                ))
+            }
         };
-        
+
         if let Some(link_state) = links.get(&link_id) {
             match link_state.transport.send(&data).await {
                 Ok(bytes_sent) => {
-                    link_state.record_sent(bytes_sent);
+                    link_state.record_sent(bytes_sent).await;
                     Ok(())
                 }
                 Err(e) => {
-                    eprintln!("Failed to send data through link {:?}: {}", link_id, e);
+                    error!("Failed to send data through link {:?}: {}", link_id, e);
                     Err(e)
                 }
             }
         } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "Selected link not found"
-            ))
+            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Selected link not found"))
         }
     }
 
@@ -539,21 +571,17 @@ impl UnorderedAggTask {
         // Generate session ID from data for consistency
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
-        
+
         let mut hasher = DefaultHasher::new();
         data.hash(&mut hasher);
         let session_id = hasher.finish();
-        
+
         // Use send_data_with_session for proper data encapsulation
         self.send_data_with_session(data, session_id, None).await
     }
 
     /// Send data through a specific link
-    pub async fn send_data_via_link(
-        &self, 
-        data: Vec<u8>, 
-        link_id: LinkId
-    ) -> UnorderedAggResult<SendResult> {
+    pub async fn send_data_via_link(&self, data: Vec<u8>, link_id: LinkId) -> UnorderedAggResult<SendResult> {
         let start_time = Instant::now();
         let data_len = data.len();
         debug!("Attempting to send {} bytes via specific link {}", data_len, link_id);
@@ -561,7 +589,7 @@ impl UnorderedAggTask {
         // Get transport and state outside of lock
         let (transport, link_state_clone) = {
             let links = self.links.read().await;
-            
+
             if let Some(link_state) = links.get(&link_id) {
                 if !link_state.is_healthy {
                     warn!("Send via link {} failed: Link is unhealthy", link_id);
@@ -575,37 +603,27 @@ impl UnorderedAggTask {
                 return Err(UnorderedAggError::LinkNotFound { link_id });
             }
         }; // Lock is released here
-        
+
         // Perform network IO outside of lock
         match transport.send(&data).await {
             Ok(bytes_sent) => {
                 let duration = start_time.elapsed();
-                link_state_clone.record_sent(bytes_sent);
+                link_state_clone.record_sent(bytes_sent).await;
                 info!("Successfully sent {} bytes via link {} in {:?}", bytes_sent, link_id, duration);
-                Ok(SendResult {
-                    bytes_sent,
-                    link_id,
-                    duration,
-                    was_retry: false,
-                })
+                Ok(SendResult { bytes_sent, link_id, duration, was_retry: false })
             }
             Err(e) => {
                 let duration = start_time.elapsed();
+                link_state_clone.record_send_failure().await;
                 error!("Send via link {} failed after {:?}: {}", link_id, duration, e);
-                Err(UnorderedAggError::NetworkError { 
-                    link_id: Some(link_id), 
-                    source: e 
-                })
+                Err(UnorderedAggError::NetworkError { link_id: Some(link_id), source: e })
             }
         }
     }
 
     /// Send data through the aggregation with session information
     pub async fn send_data_with_session(
-        &self, 
-        data: Vec<u8>, 
-        session_id: u64, 
-        original_client: Option<std::net::SocketAddr>
+        &self, data: Vec<u8>, session_id: u64, original_client: Option<std::net::SocketAddr>,
     ) -> UnorderedAggResult<SendResult> {
         let start_time = Instant::now();
         let data_len = data.len();
@@ -614,7 +632,7 @@ impl UnorderedAggTask {
         // Get transport and state outside of lock
         let (transport, link_state_clone, selected_link_id) = {
             let links = self.links.read().await;
-            
+
             trace!("Current links: {} total", links.len());
 
             if links.is_empty() {
@@ -636,11 +654,13 @@ impl UnorderedAggTask {
                     return Err(UnorderedAggError::NoHealthyLinks { total_links: links.len() });
                 }
             };
-            
+
             if let Some(link_state) = links.get(&selected_link_id) {
                 if link_state.is_healthy {
-                    info!("Sending {} bytes with session {} via link {} ({})", 
-                          data_len, session_id, selected_link_id, link_state.remote_addr);
+                    info!(
+                        "Sending {} bytes with session {} via link {} ({})",
+                        data_len, session_id, selected_link_id, link_state.remote_addr
+                    );
                     // Clone the Arc pointers for use outside of the lock
                     (link_state.transport.clone(), link_state.clone(), selected_link_id)
                 } else {
@@ -652,15 +672,17 @@ impl UnorderedAggTask {
                 return Err(UnorderedAggError::LinkNotFound { link_id: selected_link_id });
             }
         }; // Lock is released here
-        
+
         // Perform network IO outside of lock using session-aware sending
         match transport.send_with_session(&data, selected_link_id, session_id, original_client).await {
             Ok(bytes_sent) => {
                 let duration = start_time.elapsed();
                 // Update statistics using cloned state
-                link_state_clone.record_sent(bytes_sent);
-                info!("Successfully sent {} bytes with session {} via link {} in {:?}", 
-                      bytes_sent, session_id, selected_link_id, duration);
+                link_state_clone.record_sent(bytes_sent).await;
+                info!(
+                    "Successfully sent {} bytes with session {} via link {} in {:?}",
+                    bytes_sent, session_id, selected_link_id, duration
+                );
                 Ok(SendResult {
                     bytes_sent,
                     link_id: selected_link_id,
@@ -670,12 +692,12 @@ impl UnorderedAggTask {
             }
             Err(e) => {
                 let duration = start_time.elapsed();
-                error!("Send with session {} via link {} failed after {:?}: {}", 
-                       session_id, selected_link_id, duration, e);
-                Err(UnorderedAggError::NetworkError { 
-                    link_id: Some(selected_link_id), 
-                    source: e 
-                })
+                link_state_clone.record_send_failure().await;
+                error!(
+                    "Send with session {} via link {} failed after {:?}: {}",
+                    session_id, selected_link_id, duration, e
+                );
+                Err(UnorderedAggError::NetworkError { link_id: Some(selected_link_id), source: e })
             }
         }
     }
@@ -690,22 +712,18 @@ impl UnorderedAggTask {
                 link_state.record_received(data_len);
             }
         }
-        
+
         // In the unordered aggregation model, we simply forward all received data
         // to the application without any ordering or deduplication
         let received_data = ReceivedData::new(data, from_link);
         if let Err(e) = self.rx_channel.send(received_data) {
-            eprintln!("Failed to forward received data: {}", e);
+            error!("Failed to forward received data: {}", e);
         }
     }
 
     /// Handle incoming data from a link with session information
     async fn handle_incoming_data_with_session(
-        &self, 
-        data: Vec<u8>, 
-        from_link: LinkId, 
-        _session_id: u64, 
-        _original_client: Option<std::net::SocketAddr>
+        &self, data: Vec<u8>, from_link: LinkId, _session_id: u64, _original_client: Option<std::net::SocketAddr>,
     ) {
         // Update statistics for received data
         let data_len = data.len();
@@ -715,11 +733,11 @@ impl UnorderedAggTask {
                 link_state.record_received(data_len);
             }
         }
-        
+
         // Forward data with session information for transparent proxy
         let received_data = ReceivedData::with_session(data, from_link, _session_id, _original_client);
         if let Err(e) = self.rx_channel.send(received_data) {
-            eprintln!("Failed to forward received data with session: {}", e);
+            error!("Failed to forward received data with session: {}", e);
         }
     }
 
@@ -744,7 +762,7 @@ impl UnorderedAggTask {
         let mut links = self.links.write().await;
         if let Some(link_state) = links.get_mut(&link_id) {
             link_state.is_healthy = is_healthy;
-            println!("Updated link {} health: {}", link_id, is_healthy);
+            info!("Updated link {} health: {}", link_id, is_healthy);
         }
     }
 
@@ -759,26 +777,29 @@ impl UnorderedAggTask {
         for (link_id, link_state) in links.iter() {
             let bytes_sent = link_state.bytes_sent.load(Ordering::Relaxed);
             let bytes_received = link_state.bytes_received.load(Ordering::Relaxed);
-            
+
             total_bytes_sent += bytes_sent;
             total_bytes_received += bytes_received;
-            
+
             if link_state.is_healthy {
                 healthy_links += 1;
             }
 
-            link_stats.insert(*link_id, UnorderedLinkStats {
-                remote_addr: link_state.remote_addr.clone(),
-                is_healthy: link_state.is_healthy,
-                bytes_sent,
-                bytes_received,
-                last_seen: link_state.last_seen,
-                avg_rtt: 0.0, // Will be populated from load balancer metrics
-                bandwidth: 0.0, // Will be populated from load balancer metrics  
-                packet_loss_rate: 0.0, // Will be calculated from send stats
-                successful_sends: 0, // To be tracked in future enhancement
-                failed_sends: 0, // To be tracked in future enhancement
-            });
+            link_stats.insert(
+                *link_id,
+                UnorderedLinkStats {
+                    remote_addr: link_state.remote_addr.clone(),
+                    is_healthy: link_state.is_healthy,
+                    bytes_sent,
+                    bytes_received,
+                    last_seen: link_state.last_seen,
+                    avg_rtt: 0.0,          // Will be populated from load balancer metrics
+                    bandwidth: 0.0,        // Will be populated from load balancer metrics
+                    packet_loss_rate: 0.0, // Will be calculated from send stats
+                    successful_sends: 0,   // To be tracked in future enhancement
+                    failed_sends: 0,       // To be tracked in future enhancement
+                },
+            );
         }
 
         UnorderedAggStats {
@@ -798,8 +819,8 @@ pub struct UnorderedLoadBalancer {
     round_robin_index: std::sync::atomic::AtomicUsize,
     /// Link performance tracking for weighted algorithms
     link_metrics: Arc<RwLock<HashMap<LinkId, LinkMetrics>>>,
-    /// Session to link mapping for session affinity
-    session_affinity: Arc<RwLock<HashMap<u64, LinkId>>>,
+    /// Node role for directional bandwidth prioritization
+    node_role: crate::unordered_cfg::NodeRole,
 }
 
 /// Performance metrics for each link
@@ -807,39 +828,50 @@ pub struct UnorderedLoadBalancer {
 struct LinkMetrics {
     /// Average round-trip time in milliseconds
     avg_rtt: f64,
-    /// Bandwidth utilization (bytes/sec)
-    bandwidth: f64,
+    /// Sending bandwidth (bytes/sec) - important for servers
+    send_bandwidth: f64,
+    /// Receiving bandwidth (bytes/sec) - important for clients
+    recv_bandwidth: f64,
     /// Last update timestamp
     last_update: Instant,
 }
 
 impl UnorderedLoadBalancer {
     /// Create a new load balancer
-    pub fn new(strategy: LoadBalanceStrategy) -> Self {
+    pub fn new(strategy: LoadBalanceStrategy, node_role: crate::unordered_cfg::NodeRole) -> Self {
         Self {
             strategy,
             round_robin_index: std::sync::atomic::AtomicUsize::new(0),
             link_metrics: Arc::new(RwLock::new(HashMap::new())),
-            session_affinity: Arc::new(RwLock::new(HashMap::new())),
+            node_role,
         }
     }
 
-    /// Update link performance metrics
-    pub async fn update_link_metrics(&self, link_id: LinkId, rtt: Duration, bytes_per_sec: f64) {
+    /// Update link performance metrics with directional bandwidth awareness
+    pub async fn update_link_metrics(
+        &self, link_id: LinkId, rtt: Duration, send_bytes_per_sec: f64, recv_bytes_per_sec: f64,
+    ) {
         let mut metrics = self.link_metrics.write().await;
-        metrics.insert(link_id, LinkMetrics {
-            avg_rtt: rtt.as_millis() as f64,
-            bandwidth: bytes_per_sec,
-            last_update: Instant::now(),
-        });
+        metrics.insert(
+            link_id,
+            LinkMetrics {
+                avg_rtt: rtt.as_millis() as f64,
+                send_bandwidth: send_bytes_per_sec,
+                recv_bandwidth: recv_bytes_per_sec,
+                last_update: Instant::now(),
+            },
+        );
+    }
+
+    /// Update link performance metrics (backward compatibility)
+    pub async fn update_link_metrics_simple(&self, link_id: LinkId, rtt: Duration, bytes_per_sec: f64) {
+        // Assume symmetric bandwidth for backward compatibility
+        self.update_link_metrics(link_id, rtt, bytes_per_sec, bytes_per_sec).await;
     }
 
     /// Select a link for sending data
     pub async fn select_link(&self, links: &HashMap<LinkId, UnorderedLinkState>) -> Option<LinkId> {
-        let healthy_links: Vec<_> = links
-            .iter()
-            .filter(|(_, state)| state.is_healthy)
-            .collect();
+        let healthy_links: Vec<_> = links.iter().filter(|(_, state)| state.is_healthy).collect();
 
         if healthy_links.is_empty() {
             // Fallback to any available link if no healthy ones
@@ -847,21 +879,9 @@ impl UnorderedLoadBalancer {
         }
 
         match self.strategy {
-            LoadBalanceStrategy::RoundRobin => {
-                let index = self.round_robin_index
-                    .fetch_add(1, Ordering::Relaxed) % healthy_links.len();
-                Some(*healthy_links[index].0)
-            }
             LoadBalanceStrategy::PacketRoundRobin => {
                 // Packet-level round-robin without session affinity
-                let index = self.round_robin_index
-                    .fetch_add(1, Ordering::Relaxed) % healthy_links.len();
-                Some(*healthy_links[index].0)
-            }
-            LoadBalanceStrategy::Random => {
-                use rand::Rng;
-                let mut rng = rand::rng();
-                let index = rng.random_range(0..healthy_links.len());
+                let index = self.round_robin_index.fetch_add(1, Ordering::Relaxed) % healthy_links.len();
                 Some(*healthy_links[index].0)
             }
             LoadBalanceStrategy::WeightedByBandwidth => {
@@ -869,11 +889,11 @@ impl UnorderedLoadBalancer {
                 let metrics = self.link_metrics.read().await;
                 let mut best_link = *healthy_links[0].0;
                 let mut best_bandwidth = 0.0;
-                
+
                 for (link_id, _) in healthy_links {
                     if let Some(metric) = metrics.get(link_id) {
-                        if metric.bandwidth > best_bandwidth {
-                            best_bandwidth = metric.bandwidth;
+                        if metric.send_bandwidth > best_bandwidth {
+                            best_bandwidth = metric.send_bandwidth;
                             best_link = *link_id;
                         }
                     }
@@ -885,7 +905,7 @@ impl UnorderedLoadBalancer {
                 let metrics = self.link_metrics.read().await;
                 let mut best_link = *healthy_links[0].0;
                 let mut best_rtt = f64::MAX;
-                
+
                 for (link_id, _) in healthy_links {
                     if let Some(metric) = metrics.get(link_id) {
                         if metric.avg_rtt < best_rtt {
@@ -896,231 +916,228 @@ impl UnorderedLoadBalancer {
                 }
                 Some(best_link)
             }
-        }
-    }
+            LoadBalanceStrategy::WeightedByPacketLoss => {
+                // Weighted random selection using windowed packet loss rates and dynamic weights
+                // Links with lower packet loss get higher probability, with exploration mechanism
+                let mut weights = Vec::new();
+                let mut total_weight = 0.0;
 
-    /// Select a link for sending data with session affinity
-    pub async fn select_link_with_session(&self, links: &HashMap<LinkId, UnorderedLinkState>, session_id: u64) -> Option<LinkId> {
-        // For PacketRoundRobin strategy, ignore session affinity and use packet-level load balancing
-        if matches!(self.strategy, LoadBalanceStrategy::PacketRoundRobin) {
-            return self.select_link(links).await;
-        }
+                // Calculate dynamic weights for each link
+                for (link_id, link_state) in healthy_links.iter() {
+                    // Use windowed packet loss rate for more responsive adjustment
+                    let windowed_loss_rate = link_state.windowed_packet_loss_rate().await;
 
-        // For other strategies, use session affinity
-        // Check if we have session affinity
-        {
-            let affinity = self.session_affinity.read().await;
-            if let Some(&link_id) = affinity.get(&session_id) {
-                // Verify the link is still healthy
-                if let Some(link_state) = links.get(&link_id) {
-                    if link_state.is_healthy {
-                        return Some(link_id);
+                    // Get base bandwidth from metrics (with fallback)
+                    let metrics = self.link_metrics.read().await;
+                    let base_bandwidth = metrics
+                        .get(link_id)
+                        .map(|m| match self.node_role {
+                            crate::unordered_cfg::NodeRole::Client => m.recv_bandwidth,
+                            crate::unordered_cfg::NodeRole::Server => m.send_bandwidth,
+                            crate::unordered_cfg::NodeRole::Balanced => {
+                                (m.send_bandwidth + m.recv_bandwidth) / 2.0
+                            }
+                        })
+                        .unwrap_or(1.0);
+
+                    // Calculate dynamic weight with exploration mechanism
+                    let dynamic_weight = link_state.dynamic_weight(base_bandwidth).await;
+
+                    weights.push((**link_id, dynamic_weight, windowed_loss_rate));
+                    total_weight += dynamic_weight;
+
+                    debug!(
+                        "Link {} - windowed loss: {:.4}, base BW: {:.2}, dynamic weight: {:.4}",
+                        link_id, windowed_loss_rate, base_bandwidth, dynamic_weight
+                    );
+                }
+
+                if total_weight == 0.0 {
+                    // Fallback to first link if all weights are zero
+                    return Some(*healthy_links[0].0);
+                }
+
+                // Weighted random selection
+                use rand::Rng;
+                let mut rng = rand::rng();
+                let mut random_value = rng.random::<f64>() * total_weight;
+
+                for (link_id, weight, loss_rate) in &weights {
+                    random_value -= weight;
+                    if random_value <= 0.0 {
+                        debug!(
+                            "Selected link {} with dynamic weight {:.2}/{:.2} (windowed loss rate: {:.4})",
+                            link_id, weight, total_weight, loss_rate
+                        );
+                        return Some(*link_id);
                     }
                 }
-                // Link is unhealthy, we'll select a new one below
+
+                // Fallback to last link (shouldn't happen)
+                Some(weights.last().unwrap().0)
+            }
+            LoadBalanceStrategy::DynamicAdaptive => {
+                // Advanced dynamic selection using windowed statistics and exploration
+                // This strategy automatically recovers from temporary link issues
+                let metrics = self.link_metrics.read().await;
+                let mut weights = Vec::new();
+                let mut total_weight = 0.0;
+
+                // Calculate dynamic weights for each link
+                for (link_id, link_state) in healthy_links.iter() {
+                    let send_bandwidth = metrics.get(link_id).map(|m| m.send_bandwidth).unwrap_or(1.0);
+
+                    let recv_bandwidth = metrics.get(link_id).map(|m| m.recv_bandwidth).unwrap_or(1.0);
+
+                    // Select primary bandwidth based on node role
+                    let primary_bandwidth = match self.node_role {
+                        crate::unordered_cfg::NodeRole::Client => recv_bandwidth,
+                        crate::unordered_cfg::NodeRole::Server => send_bandwidth,
+                        crate::unordered_cfg::NodeRole::Balanced => (send_bandwidth + recv_bandwidth) / 2.0,
+                    };
+
+                    // Calculate dynamic weight with exploration mechanism
+                    let dynamic_weight = link_state.dynamic_weight(primary_bandwidth).await;
+
+                    // Get debug info for logging
+                    let mut windowed_stats = link_state.windowed_stats.write().await;
+                    let (loss_rate, speed, entries_count) = windowed_stats.get_debug_info();
+                    drop(windowed_stats); // Release lock
+
+                    weights.push((**link_id, dynamic_weight, loss_rate, speed));
+                    total_weight += dynamic_weight;
+
+                    debug!("Link {} - primary BW: {:.2}, windowed loss: {:.4}, speed: {:.2}, weight: {:.4}, entries: {}",
+                           link_id, primary_bandwidth, loss_rate, speed, dynamic_weight, entries_count);
+                }
+
+                if total_weight == 0.0 {
+                    // Fallback to first link if all weights are zero
+                    return Some(*healthy_links[0].0);
+                }
+
+                // Weighted random selection
+                use rand::Rng;
+                let mut rng = rand::rng();
+                let mut random_value = rng.random::<f64>() * total_weight;
+
+                for (link_id, weight, loss_rate, speed) in &weights {
+                    random_value -= weight;
+                    if random_value <= 0.0 {
+                        debug!(
+                            "Selected link {} with dynamic weight {:.4}/{:.4} (loss: {:.4}, speed: {:.2})",
+                            link_id, weight, total_weight, loss_rate, speed
+                        );
+                        return Some(*link_id);
+                    }
+                }
+
+                // Fallback to last link (shouldn't happen)
+                Some(weights.last().unwrap().0)
             }
         }
-
-        // No existing affinity or link is unhealthy, select a new link
-        if let Some(selected_link) = self.select_link(links).await {
-            // Store session affinity
-            let mut affinity = self.session_affinity.write().await;
-            affinity.insert(session_id, selected_link);
-            Some(selected_link)
-        } else {
-            None
-        }
     }
 
-    /// Clean up old session affinities
-    pub async fn cleanup_old_sessions(&self, max_age: Duration) {
-        let mut affinity = self.session_affinity.write().await;
-        let _cutoff = Instant::now() - max_age;
-        // Note: We'd need to track session last-used time for proper cleanup
-        // For now, just limit the size
-        if affinity.len() > 1000 {
-            affinity.clear();
-        }
+    /// Select a link for sending data - all strategies now use packet-level load balancing
+    pub async fn select_link_with_session(
+        &self, links: &HashMap<LinkId, UnorderedLinkState>, _session_id: u64,
+    ) -> Option<LinkId> {
+        // All strategies now ignore session affinity and use packet-level load balancing for maximum throughput
+        self.select_link(links).await
     }
 }
 
-/// Unordered aggregation handle for external API
-pub struct UnorderedAggHandle {
-    /// Control channel for sending commands
-    control_tx: mpsc::UnboundedSender<UnorderedControlMsg>,
-    /// Data channel for receiving incoming data  
-    rx_channel: mpsc::UnboundedReceiver<ReceivedData>,
+/// 滑动窗口性能统计
+#[derive(Debug, Clone)]
+struct WindowedStats {
+    /// 时间窗口记录 (时间戳, 成功数, 失败数, 发送字节数)
+    entries: VecDeque<(Instant, u64, u64, u64)>,
+    /// 窗口大小
+    window_duration: Duration,
+    /// 最小探索权重（防止链路完全被忽略）
+    min_exploration_weight: f64,
 }
 
-impl UnorderedAggHandle {
-    /// Create a new handle
-    pub fn new(
-        control_tx: mpsc::UnboundedSender<UnorderedControlMsg>,
-        rx_channel: mpsc::UnboundedReceiver<ReceivedData>,
-    ) -> Self {
+impl WindowedStats {
+    fn new(window_duration: Duration) -> Self {
         Self {
-            control_tx,
-            rx_channel,
+            entries: VecDeque::new(),
+            window_duration,
+            min_exploration_weight: 0.1, // 至少保留10%的权重用于探索
         }
     }
 
-    /// Add a new link to the aggregation
-    pub async fn add_link(
-        &self,
-        link_id: LinkId,
-        transport: Arc<dyn UnorderedLinkTransport>,
-    ) -> Result<(), mpsc::error::SendError<UnorderedControlMsg>> {
-        self.control_tx.send(UnorderedControlMsg::AddLink { link_id, transport })
+    /// 添加新的统计记录
+    fn add_record(&mut self, successful: u64, failed: u64, bytes_sent: u64) {
+        let now = Instant::now();
+        self.entries.push_back((now, successful, failed, bytes_sent));
+        self.cleanup_old_entries(now);
     }
 
-    /// Remove a link from the aggregation
-    pub async fn remove_link(&self, link_id: LinkId) -> Result<(), mpsc::error::SendError<UnorderedControlMsg>> {
-        self.control_tx.send(UnorderedControlMsg::RemoveLink { link_id })
-    }
-
-    /// Get aggregation statistics
-    pub async fn get_stats(&self) -> Result<UnorderedAggStats, Box<dyn std::error::Error + Send + Sync>> {
-        let (tx, rx) = oneshot::channel();
-        self.control_tx.send(UnorderedControlMsg::GetStats { respond_to: tx })?;
-        let stats = rx.await?;
-        Ok(stats)
-    }
-
-    /// Send data through the aggregation
-    pub async fn send(&self, data: Vec<u8>) -> UnorderedAggResult<SendResult> {
-        let (tx, rx) = oneshot::channel();
-        self.control_tx.send(UnorderedControlMsg::SendData { 
-            data, 
-            respond_to: tx 
-        }).map_err(|e| UnorderedAggError::ChannelClosed { context: format!("sending SendData control message: {}", e) })?;
-        
-        // Wait for send completion and propagate the result
-        rx.await.map_err(|e| UnorderedAggError::TimeoutOrRecvError { operation: format!("waiting for SendData response: {}", e) })?
-    }
-
-    /// Send data through a specific link
-    pub async fn send_via_link(
-        &self, 
-        data: Vec<u8>, 
-        link_id: LinkId
-    ) -> UnorderedAggResult<SendResult> {
-        let (tx, rx) = oneshot::channel();
-        self.control_tx.send(UnorderedControlMsg::SendDataViaLink { 
-            data, 
-            link_id,
-            respond_to: tx 
-        }).map_err(|e| UnorderedAggError::ChannelClosed { context: format!("sending SendDataViaLink control message: {}", e) })?;
-        
-        // Wait for send completion and propagate the result
-        rx.await.map_err(|e| UnorderedAggError::TimeoutOrRecvError { operation: format!("waiting for SendDataViaLink response: {}", e) })?
-    }
-
-    /// Send data through the aggregation with session information
-    pub async fn send_with_session(
-        &self, 
-        data: Vec<u8>, 
-        session_id: u64, 
-        original_client: Option<std::net::SocketAddr>
-    ) -> UnorderedAggResult<SendResult> {
-        let (tx, rx) = oneshot::channel();
-        self.control_tx.send(UnorderedControlMsg::SendDataWithSession { 
-            data, 
-            session_id,
-            original_client,
-            respond_to: tx 
-        }).map_err(|e| UnorderedAggError::ChannelClosed { context: format!("sending SendDataWithSession control message: {}", e) })?;
-        
-        // Wait for send completion and propagate the result
-        rx.await.map_err(|e| UnorderedAggError::TimeoutOrRecvError { operation: format!("waiting for SendDataWithSession response: {}", e) })?
-    }
-
-    /// Receive data from any link (returns full ReceivedData with session info)
-    pub async fn recv(&mut self) -> Option<ReceivedData> {
-        self.rx_channel.recv().await
-    }
-    
-    /// Receive data from any link (legacy method for backward compatibility)
-    pub async fn recv_legacy(&mut self) -> Option<(Vec<u8>, LinkId)> {
-        match self.rx_channel.recv().await {
-            Some(received_data) => Some((received_data.data, received_data.link_id)),
-            None => None,
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    /// Mock transport for testing
-    #[derive(Debug)]
-    struct MockTransport {
-        remote_addr: String,
-        send_count: AtomicUsize,
-    }
-
-    impl MockTransport {
-        fn new(addr: &str) -> Self {
-            Self {
-                remote_addr: addr.to_string(),
-                send_count: AtomicUsize::new(0),
+    /// 清理过期的记录
+    fn cleanup_old_entries(&mut self, now: Instant) {
+        while let Some(&(timestamp, _, _, _)) = self.entries.front() {
+            if now.duration_since(timestamp) > self.window_duration {
+                self.entries.pop_front();
+            } else {
+                break;
             }
         }
     }
 
-    #[async_trait::async_trait]
-    impl UnorderedLinkTransport for MockTransport {
-        async fn send_raw(&self, data: &[u8]) -> Result<usize, std::io::Error> {
-            self.send_count.fetch_add(1, Ordering::Relaxed);
-            Ok(data.len())
+    /// 获取窗口内的丢包率
+    fn windowed_packet_loss_rate(&mut self) -> f64 {
+        let now = Instant::now();
+        self.cleanup_old_entries(now);
+
+        let (total_successful, total_failed) =
+            self.entries.iter().fold((0u64, 0u64), |(acc_s, acc_f), &(_, s, f, _)| (acc_s + s, acc_f + f));
+
+        let total = total_successful + total_failed;
+        if total == 0 {
+            0.0
+        } else {
+            total_failed as f64 / total as f64
+        }
+    }
+
+    /// 获取窗口内的平均发送速度
+    fn windowed_send_speed(&mut self) -> f64 {
+        let now = Instant::now();
+        self.cleanup_old_entries(now);
+
+        if self.entries.is_empty() {
+            return 0.0;
         }
 
-        fn remote_addr(&self) -> String {
-            self.remote_addr.clone()
+        let total_bytes: u64 = self.entries.iter().map(|(_, _, _, bytes)| bytes).sum();
+        let oldest_time = self.entries.front().map(|(t, _, _, _)| *t).unwrap_or(now);
+        let duration = now.duration_since(oldest_time).as_secs_f64();
+
+        if duration > 0.0 {
+            total_bytes as f64 / duration
+        } else {
+            0.0
         }
     }
 
-    #[tokio::test]
-    async fn test_unordered_link_state_creation() {
-        let transport = Arc::new(MockTransport::new("127.0.0.1:8080"));
-        let link_state = UnorderedLinkState::new(LinkId(1), transport);
-        
-        assert_eq!(link_state.link_id, LinkId(1));
-        assert_eq!(link_state.remote_addr, "127.0.0.1:8080");
-        assert!(link_state.is_healthy);
+    /// 计算动态权重（包含探索机制）
+    fn dynamic_weight(&mut self, base_bandwidth: f64) -> f64 {
+        let loss_rate = self.windowed_packet_loss_rate();
+        let speed = self.windowed_send_speed();
+
+        // 基础权重：考虑带宽和丢包率
+        let quality_weight = (base_bandwidth + speed) * (1.0 - loss_rate).powi(2);
+
+        // 添加探索权重：确保即使表现不好的链路也能获得一些流量来尝试恢复
+        let exploration_weight = base_bandwidth * self.min_exploration_weight;
+
+        // 总权重 = 质量权重 + 探索权重
+        quality_weight + exploration_weight
     }
 
-    #[tokio::test]
-    async fn test_load_balancer_round_robin() {
-        let lb = UnorderedLoadBalancer::new(LoadBalanceStrategy::RoundRobin);
-        let mut links = HashMap::new();
-        
-        let transport1 = Arc::new(MockTransport::new("127.0.0.1:8080"));
-        let transport2 = Arc::new(MockTransport::new("127.0.0.1:8081"));
-        
-        links.insert(LinkId(1), UnorderedLinkState::new(LinkId(1), transport1));
-        links.insert(LinkId(2), UnorderedLinkState::new(LinkId(2), transport2));
-
-        // Test round-robin behavior
-        let first = lb.select_link(&links).await;
-        let second = lb.select_link(&links).await;
-        let third = lb.select_link(&links).await;
-        
-        assert_ne!(first, second);
-        assert_eq!(first, third); // Should cycle back
-    }
-
-    #[tokio::test]
-    async fn test_aggregation_task_creation() {
-        let config = UnorderedCfg::default();
-        let (tx_rx, _rx_rx) = mpsc::unbounded_channel();
-        let (tx_control, _rx_control) = mpsc::unbounded_channel();
-        
-        let task = UnorderedAggTask::new(config, tx_rx, tx_control);
-        let stats = task.get_stats().await;
-        
-        assert_eq!(stats.active_links, 0);
-        assert_eq!(stats.healthy_links, 0);
+    /// 获取统计信息用于调试
+    fn get_debug_info(&mut self) -> (f64, f64, usize) {
+        (self.windowed_packet_loss_rate(), self.windowed_send_speed(), self.entries.len())
     }
 }

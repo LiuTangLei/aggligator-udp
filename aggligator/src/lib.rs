@@ -128,4 +128,6 @@ pub use control::{Control, Link};
 pub use transport::{Acceptor, Connector};
 pub use unordered_cfg::{LoadBalanceStrategy, UnorderedCfg};
 pub use unordered_msg::UnorderedLinkMsg;
-pub use unordered_task::{UnorderedAggTask, UnorderedAggHandle, UnorderedAggStats, UnorderedControlMsg, UnorderedLinkState, UnorderedLinkTransport};
+pub use unordered_task::{
+    UnorderedAggStats, UnorderedAggTask, UnorderedControlMsg, UnorderedLinkState, UnorderedLinkTransport,
+};

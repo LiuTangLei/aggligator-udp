@@ -54,6 +54,7 @@ rustls = "0.23"
 rustls-pemfile = "2.0"
 socket2 = "0.5"
 tracing-log = "0.2"
+rand.workspace = true
 
 [[bin]]
 name = "agg-speed"

@@ -30,9 +30,9 @@ agg-udp [OPTIONS] <COMMAND>
 
 ### Global Options
 
-- `--cfg <FILE>`: Configuration file for advanced settings
-- `--verbose, -v`: Enable verbose debug logging
-- `--stats-interval <SECONDS>`: Statistics reporting interval (default: 5)
+- `--cfg <FILE>`: Configuration file for advanced settings (e.g., `example-udp-config.json` or a TOML file).
+- `--verbose, -v`: Enable verbose debug logging.
+- `--stats-interval <SECONDS>`: Statistics reporting interval in seconds (default: 5).
 
 ### Commands
 
@@ -45,14 +45,14 @@ agg-udp server [OPTIONS]
 ```
 
 **Options:**
-- `--bind <ADDR>`: Server bind address (default: 0.0.0.0:5801)
-- `--target <ADDR>`: Target address to forward aggregated traffic
-- `--links <COUNT>`: Number of server links to create (default: 4)
-- `--buffer-size <SIZE>`: UDP socket buffer size in bytes (default: 65536)
+- `--bind <ADDR>`: Server bind address (default: `0.0.0.0:5801`). This is the address `agg-udp` listens on for incoming client connections.
+- `--target <ADDR>`: Target address to forward aggregated traffic to (e.g., your application server like `127.0.0.1:8080`).
+- `--links <COUNT>`: Number of server links (logical pathways for aggregation) to create (default: 4). This doesn't directly translate to the number of UDP sockets opened by the server for listening, but rather to the capacity of the aggregation logic.
+- `--buffer-size <SIZE>`: UDP socket receive/send buffer size in bytes (default: 65536). Adjust based on expected traffic and system capabilities.
 
 **Example:**
 ```bash
-# Start server on port 5801, forward to localhost:8080 with 6 links
+# Start server on port 5801, forward aggregated traffic to localhost:8080, with 6 logical links
 agg-udp server --bind 0.0.0.0:5801 --target 127.0.0.1:8080 --links 6
 ```
 
@@ -65,20 +65,22 @@ agg-udp client [OPTIONS]
 ```
 
 **Options:**
-- `--local <ADDR>`: Local bind address (default: 127.0.0.1:0)
-- `--remote <ADDR>`: Remote server addresses (can specify multiple)
-- `--strategy <STRATEGY>`: Load balancing strategy
-  - `round-robin`: Distribute packets in round-robin fashion
-  - `random`: Random link selection
-  - `weighted`: Weight-based distribution
-  - `fastest`: Use the fastest responding link
-- `--timeout <MS>`: Connection timeout in milliseconds (default: 5000)
-- `--health-check <MS>`: Health check interval in milliseconds (default: 1000)
+- `--local <ADDR>`: Local bind address for the client's outgoing connections (e.g., `127.0.0.1:0` to let the OS choose a port). Can be a single address or multiple for multi-link from distinct local endpoints.
+- `--remote <ADDR>`: Remote server addresses. Specify one or more `agg-udp` server addresses (e.g., `192.168.1.10:5801`). Each `--remote` creates a link.
+- `--target <ADDR>`: Local address that the client listens on and forwards received aggregated traffic to (e.g. `127.0.0.1:3000` where your local application listens).
+- `--strategy <STRATEGY>`: Load balancing strategy for distributing packets across multiple remote links.
+  - `round-robin`: Distribute packets sequentially across available links.
+  - `random`: Randomly select a link for each packet.
+  - `weighted`: Distribute packets based on configured weights for each link (requires further configuration in the config file).
+  - `fastest`: Send packets to the link with the lowest observed latency (experimental, may require specific health check setup).
+- `--timeout <MS>`: Connection timeout in milliseconds for establishing links (default: 5000).
+- `--health-check <MS>`: Interval in milliseconds for sending health checks to maintain link status (default: 1000).
 
 **Example:**
 ```bash
-# Connect to multiple servers with round-robin load balancing
-agg-udp client --local 127.0.0.1:3000 \
+# Client listens on 127.0.0.1:3000 for local application traffic,
+# connects to three remote agg-udp servers, and uses round-robin.
+agg-udp client --target 127.0.0.1:3000 \
                --remote 192.168.1.10:5801 \
                --remote 192.168.1.11:5801 \
                --remote 192.168.1.12:5801 \
@@ -114,90 +116,125 @@ agg-udp test --server 192.168.1.10:5801 \
 
 ## Configuration File
 
-Advanced settings can be specified in a TOML configuration file:
+Advanced settings can be specified in a JSON or TOML configuration file. 
+`agg-udp` will try to load `example-udp-config.json` if present, or you can specify one with `--cfg`.
 
-```toml
-# example-config.toml
-
-[network]
-# UDP socket buffer sizes
-send_buffer_size = 1048576    # 1MB
-recv_buffer_size = 1048576    # 1MB
-
-# Connection settings
-connect_timeout_ms = 3000
-health_check_interval_ms = 500
-
-[aggregation]
-# Load balancing strategy
-strategy = "round-robin"  # or "random", "weighted", "fastest"
-
-# Link management
-max_links = 16
-min_healthy_links = 2
-
-[performance]
-# Statistics and monitoring
-stats_interval_seconds = 5
-enable_detailed_stats = true
-
-# Performance tuning
-batch_size = 32
-worker_threads = 4
-
-[logging]
-level = "info"  # or "debug", "warn", "error"
-enable_timestamps = true
+**Example JSON (`example-udp-config.json`):**
+```json
+{
+  "network": {
+    "send_buffer_size": 1048576,
+    "recv_buffer_size": 1048576,
+    "connect_timeout_ms": 3000,
+    "health_check_interval_ms": 500
+  },
+  "aggregation": {
+    "strategy": "round-robin", // "random", "weighted", "fastest"
+    "max_links": 16,
+    "min_healthy_links": 1 // Adjusted from 2 for typical single server scenarios
+  },
+  "performance": {
+    "stats_interval_seconds": 5,
+    "enable_detailed_stats": true,
+    "batch_size": 32,
+    "worker_threads": 4 // Number of Tokio worker threads
+  },
+  "logging": {
+    "level": "info", // "debug", "warn", "error"
+    "enable_timestamps": true
+  }
+}
 ```
 
-Use with: `agg-udp --cfg example-config.toml <command>`
+Use with: `agg-udp --cfg my-config.json <command>` or `agg-udp --cfg my-config.toml <command>`
 
 ## Usage Scenarios
 
-### 1. High-Throughput Data Transfer
+### 1. High-Throughput Data Transfer (Client to Server)
 
-**Scenario**: Transfer large amounts of data between two locations with multiple network paths.
-
-**Setup**:
-```bash
-# On the receiver side
-agg-udp server --bind 0.0.0.0:5801 --target 127.0.0.1:8080 --links 8
-
-# On the sender side  
-agg-udp client --local 127.0.0.1:3000 \
-               --remote server1:5801 \
-               --remote server2:5801 \
-               --remote server3:5801 \
-               --strategy fastest
-```
-
-### 2. Load Balancing and Redundancy
-
-**Scenario**: Distribute UDP traffic across multiple servers for load balancing.
+**Scenario**: A client application sends a large volume of UDP data to a server application, using `agg-udp` to potentially bond multiple network paths or improve resilience.
 
 **Setup**:
-```bash
-# Client with weighted load balancing
-agg-udp client --remote 192.168.1.10:5801 \
-               --remote 192.168.1.11:5801 \
-               --remote 192.168.1.12:5801 \
-               --strategy weighted
-```
+
+*   **Server Side (`agg-udp` server):** Listens for aggregated UDP traffic from the `agg-udp` client and forwards it to the actual server application.
+    ```bash
+    # agg-udp server listens on 0.0.0.0:5801
+    # Forwards received (de-aggregated) packets to the actual server app at 127.0.0.1:8080
+    agg-udp server --bind 0.0.0.0:5801 --target 127.0.0.1:8080 --links 8
+    ```
+
+*   **Client Side (`agg-udp` client):** Listens for UDP traffic from the local client application, aggregates it, and sends it over one or more links to the `agg-udp` server.
+    ```bash
+    # Local client app sends UDP data to 127.0.0.1:3000
+    # agg-udp client listens on 127.0.0.1:3000
+    # Connects to agg-udp server(s) (e.g., server1:5801, server2:5801)
+    # Uses 'fastest' link strategy
+    agg-udp client --target 127.0.0.1:3000 \
+                   --remote server1.example.com:5801 \
+                   --remote server2.example.com:5801 \
+                   --strategy fastest
+    ```
+Your client application would then be configured to send its UDP packets to `127.0.0.1:3000`.
+Your server application would listen on `127.0.0.1:8080`.
+
+### 2. Load Balancing and Redundancy (Client to Multiple Servers)
+
+**Scenario**: A client application needs to distribute its UDP traffic across multiple instances of a server application, potentially hosted on different machines, for load balancing and redundancy. `agg-udp` client connects to multiple `agg-udp` servers, each forwarding to a backend application server.
+
+**Setup**:
+
+*   **Server Side (multiple `agg-udp` servers, each fronting an app server instance):**
+    *   `agg-udp-server-1` on `192.168.1.10` forwarding to `app-server-1` on `127.0.0.1:8080` (local to `192.168.1.10`)
+        ```bash
+        # On machine 192.168.1.10
+        agg-udp server --bind 0.0.0.0:5801 --target 127.0.0.1:8080
+        ```
+    *   `agg-udp-server-2` on `192.168.1.11` forwarding to `app-server-2` on `127.0.0.1:8080` (local to `192.168.1.11`)
+        ```bash
+        # On machine 192.168.1.11
+        agg-udp server --bind 0.0.0.0:5801 --target 127.0.0.1:8080
+        ```
+    *   `agg-udp-server-3` on `192.168.1.12` forwarding to `app-server-3` on `127.0.0.1:8080` (local to `192.168.1.12`)
+        ```bash
+        # On machine 192.168.1.12
+        agg-udp server --bind 0.0.0.0:5801 --target 127.0.0.1:8080
+        ```
+
+*   **Client Side (`agg-udp` client):** Listens for local application traffic and distributes it across the remote `agg-udp` servers.
+    ```bash
+    # Local client app sends UDP data to 127.0.0.1:3000
+    # agg-udp client listens on 127.0.0.1:3000
+    # Connects to the three agg-udp servers with weighted load balancing (weights configured in JSON/TOML)
+    agg-udp client --target 127.0.0.1:3000 \
+                   --remote 192.168.1.10:5801 \
+                   --remote 192.168.1.11:5801 \
+                   --remote 192.168.1.12:5801 \
+                   --strategy weighted --cfg my-weighted-config.json 
+    ```
+    (Assuming `my-weighted-config.json` defines the weights for the links).
 
 ### 3. Performance Testing
 
-**Scenario**: Test the capacity of a UDP-based service.
+**Scenario**: Test the capacity and performance of a UDP-based service or network path.
 
 **Setup**:
-```bash
-# High-rate performance test
-agg-udp test --server target-server:5801 \
-             --duration 120 \
-             --packet-size 1400 \
-             --rate 10000 \
-             --links 12 \
-             --parallel
-```
+
+*   **Server Side (`agg-udp` server):** Set up to receive and process test packets.
+    ```bash
+    # agg-udp server setup for testing
+    agg-udp server --bind 0.0.0.0:5801 --target 127.0.0.1:8080 --links 4
+    ```
+
+*   **Client Side (`agg-udp` client in test mode):** Configured to send a specific rate of packets for a defined duration.
+    ```bash
+    # Performance test with 1KB packets at 5000 PPS for 60 seconds
+    agg-udp test --server 192.168.1.10:5801 \
+                 --duration 60 \
+                 --packet-size 1024 \
+                 --rate 5000 \
+                 --links 4 \
+                 --parallel
+    ```
 
 ## Performance Monitoring
 
@@ -211,9 +248,11 @@ The tool provides real-time statistics including:
 
 Example output:
 ```
-[2024-01-15 10:30:15] UDP Aggregation Stats:
+[2024-01-15 10:30:15] UDP Aggregation Stats: // Note: Timestamp is illustrative
   Total Links: 4 (4 healthy, 0 failed)
   Throughput: 15,432 pps, 23.4 MB/s
+  Client Target: 127.0.0.1:3000 (if in client mode)
+  Server Target: 127.0.0.1:8080 (if in server mode)
   Load Distribution:
     Link 1 (192.168.1.10:5801): 25.2% - 3,889 pps, 5.9 MB/s
     Link 2 (192.168.1.11:5801): 24.8% - 3,826 pps, 5.8 MB/s  
@@ -227,11 +266,12 @@ Example output:
 
 The tool is built on the Aggligator framework and consists of:
 
-1. **Unordered Aggregation Core**: Protocol-agnostic packet aggregation
-2. **UDP Transport Layer**: UDP-specific networking implementation  
-3. **Load Balancing**: Multiple strategies for traffic distribution
-4. **Health Monitoring**: Link health detection and failover
-5. **Statistics Engine**: Real-time performance monitoring
+1. **Unordered Aggregation Core**: Protocol-agnostic packet aggregation provided by the `aggligator` crate.
+2. **UDP Transport Layer**: UDP-specific networking implementation using `aggligator-transport-udp`.
+3. **Command Line Interface**: Parsing arguments, configuring, and running server/client/test modes.
+4. **Load Balancing**: Multiple strategies for traffic distribution across links.
+5. **Health Monitoring**: Link health detection and failover.
+6. **Statistics Engine**: Real-time performance monitoring.
 
 ## Troubleshooting
 
