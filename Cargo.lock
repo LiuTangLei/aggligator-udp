@@ -91,6 +91,7 @@ name = "aggligator-transport-udp"
 version = "0.1.0"
 dependencies = [
  "aggligator",
+ "aggligator-transport-tcp",
  "async-trait",
  "bincode",
  "bytes",

@@ -11,6 +11,8 @@ use tracing::{debug, error, info};
 
 use aggligator::unordered_task::UnorderedLinkTransport;
 
+pub mod connector;
+
 /// UDP transport implementation for unordered aggregation
 #[derive(Debug)]
 pub struct UdpTransport {
