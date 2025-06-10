@@ -4,6 +4,7 @@ members = [
     "aggligator-monitor",
     "aggligator-transport-bluer",
     "aggligator-transport-tcp",
+    "aggligator-transport-udp",
     "aggligator-transport-usb",
     "aggligator-transport-websocket",
     "aggligator-util",
