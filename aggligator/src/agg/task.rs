@@ -267,6 +267,10 @@ pub struct Task<TX, RX, TAG> {
     resend_queue: VecDeque<Arc<SentReliable>>,
     /// Ids of links that are ready to send data.
     idle_links: Vec<usize>,
+    /// Dynamic weights for each link.
+    link_weights: Vec<f64>,
+    /// Last observed total bytes sent and hang count for each link.
+    last_stats: Vec<(u64, usize)>,
     /// Next data sequence number for handing out.
     rx_seq: Seq,
     /// Received message parts, with sequence numbers starting at `rx_seq`.
@@ -356,6 +360,8 @@ where
             txed_unacked: 0,
             resend_queue: VecDeque::new(),
             idle_links: Vec::new(),
+            link_weights: Vec::new(),
+            last_stats: Vec::new(),
             rx_seq: Seq::ZERO,
             rxed_reliable: VecDeque::new(),
             rxed_reliable_consumable: VecDeque::new(),
@@ -542,7 +548,7 @@ where
 
             // Task for receiving requests from sender.
             let sendable_idle_link_id =
-                self.idle_links.iter().rev().cloned().find(|id| self.links[*id].as_ref().unwrap().is_sendable());
+                Self::weighted_idle_link(&self.idle_links, &self.links, &self.link_weights, true);
             let write_rx_task = async {
                 if links_idling && is_consume_ack_required {
                     TaskEvent::SendConsumed
@@ -863,7 +869,7 @@ where
                     self.send_reliable_over_link(id, ReliableMsg::Data(data));
                 }
                 TaskEvent::SendConsumed => {
-                    let id = self.idle_links.pop().unwrap();
+                    let id = self.take_best_idle_link(true).unwrap();
                     let consumed = self.rxed_reliable_consumed_since_last_ack as u32;
                     tracing::trace!("acking {consumed} consumed bytes over idle link {id}");
                     self.send_reliable_over_link(id, ReliableMsg::Consumed(consumed));
@@ -873,7 +879,7 @@ where
                 TaskEvent::WriteEnd => {
                     tracing::debug!("sender was dropped");
                     self.write_rx = None;
-                    if let Some(id) = self.idle_links.pop() {
+                    if let Some(id) = self.take_best_idle_link(true) {
                         tracing::debug!("sending SendFinish over idle link {id}");
                         self.send_reliable_over_link(id, ReliableMsg::SendFinish);
                         self.send_finish_sent = true;
@@ -906,8 +912,7 @@ where
                     self.unconfirm_link(id, NotWorkingReason::AckTimeout);
                 }
                 TaskEvent::Resend(packet) => {
-                    let id = sendable_idle_link_id.unwrap();
-                    self.idle_links.retain(|&idle_id| idle_id != id);
+                    let id = self.take_best_idle_link(true).unwrap();
                     tracing::trace!("resending message {} over idle link {id}", packet.seq);
                     self.resend_reliable_over_link(id, packet);
                 }
@@ -915,7 +920,7 @@ where
                     tracing::debug!("receiver was dropped");
                     self.read_tx = None;
                     self.read_closed_rx = None;
-                    if let Some(id) = self.idle_links.pop() {
+                    if let Some(id) = self.take_best_idle_link(true) {
                         tracing::debug!("sending ReceiveFinish over idle link {id}");
                         self.send_reliable_over_link(id, ReliableMsg::ReceiveFinish);
                         self.receive_finish_sent = true;
@@ -926,7 +931,7 @@ where
                 TaskEvent::ReadClosed => {
                     tracing::debug!("receiver was closed");
                     self.read_closed_rx = None;
-                    if let Some(id) = self.idle_links.pop() {
+                    if let Some(id) = self.take_best_idle_link(true) {
                         self.send_reliable_over_link(id, ReliableMsg::ReceiveClose);
                         self.receive_close_sent = true;
                     }
@@ -986,6 +991,7 @@ where
                             link.publish_stats();
                         }
                     }
+                    self.update_link_weights();
                 }
                 TaskEvent::RefusedLinkTask => (),
                 TaskEvent::ServerChanged => {
@@ -1061,6 +1067,13 @@ where
             if link_opt.is_none() {
                 *link_opt = Some(link);
                 self.publish_links();
+                if id >= self.link_weights.len() {
+                    self.link_weights.resize(id + 1, 1.0);
+                    self.last_stats.resize(id + 1, (0, 0));
+                } else {
+                    self.link_weights[id] = 1.0;
+                    self.last_stats[id] = (0, 0);
+                }
                 return id;
             }
         }
@@ -1068,7 +1081,11 @@ where
         self.links.push(Some(link));
         self.publish_links();
 
-        self.links.len() - 1
+        let id = self.links.len() - 1;
+        self.link_weights.resize(id + 1, 1.0);
+        self.last_stats.resize(id + 1, (0, 0));
+
+        id
     }
 
     /// Removes the link with the specified index.
@@ -1081,6 +1098,11 @@ where
         // Send disconnect reason.
         let link = self.links[id].take().unwrap();
         link.notify_disconnected(reason);
+
+        if id < self.link_weights.len() {
+            self.link_weights[id] = 0.0;
+            self.last_stats[id] = (0, 0);
+        }
 
         // Cleanup and publish links.
         while let Some(None) = self.links.last() {
@@ -1126,6 +1148,53 @@ where
     /// Returns whether a sequence number is available for sending.
     fn tx_seq_avail(&self) -> bool {
         self.txed_packets.front().map(|p| self.tx_seq - p.seq <= Seq::USABLE_INTERVAL).unwrap_or(true)
+    }
+
+    /// Returns the id of an idle link selected using weighted round-robin.
+    ///
+    /// The weight is based on the currently available congestion window and the
+    /// measured RTT, allowing links with more capacity to handle more traffic.
+    /// If `sendable` is true, only considers links that can send more data.
+    fn weighted_idle_link(
+        idle_links: &[usize], links: &[Option<LinkInt<TX, RX, TAG>>], link_weights: &[f64], sendable: bool,
+    ) -> Option<usize> {
+        let mut weighted = Vec::new();
+        let mut total = 0.0f64;
+        for &id in idle_links {
+            let link = links[id].as_ref().unwrap();
+            if sendable && !link.is_sendable() {
+                continue;
+            }
+            let avail = link.txed_unacked_data_limit.saturating_sub(link.txed_unacked_data) as f64;
+            if avail <= 0.0 {
+                continue;
+            }
+            let rtt = link.roundtrip.as_secs_f64().max(0.001);
+            let w_extra = link_weights.get(id).copied().unwrap_or(1.0);
+            let weight = w_extra * avail / rtt;
+            weighted.push((id, weight));
+            total += weight;
+        }
+
+        if weighted.is_empty() {
+            return None;
+        }
+
+        let mut r = rand::random::<f64>() * total;
+        for (id, w) in &weighted {
+            if r < *w {
+                return Some(*id);
+            }
+            r -= *w;
+        }
+        Some(weighted.last().unwrap().0)
+    }
+
+    /// Removes and returns the id of the best idle link.
+    fn take_best_idle_link(&mut self, sendable: bool) -> Option<usize> {
+        let id = Self::weighted_idle_link(&self.idle_links, &self.links, &self.link_weights, sendable)?;
+        self.idle_links.retain(|&x| x != id);
+        Some(id)
     }
 
     /// Adjusts the link transmission buffer limits to ensure that no link stalls the channel.
@@ -1831,6 +1900,40 @@ where
                 recved_unconsumed: self.rxed_reliable_size,
                 recved_unconsumed_count: self.rxed_reliable.len(),
             });
+        }
+    }
+
+    /// Adjusts link weights based on recent statistics.
+    fn update_link_weights(&mut self) {
+        for (id, link_opt) in self.links.iter().enumerate() {
+            if let Some(link) = link_opt {
+                let stats = Link::from(link).stats();
+                if id >= self.link_weights.len() {
+                    self.link_weights.resize(id + 1, 1.0);
+                    self.last_stats.resize(id + 1, (stats.total_sent, stats.hangs));
+                    continue;
+                }
+                let (prev_sent, prev_hangs) = self.last_stats[id];
+                let sent_diff = stats.total_sent.saturating_sub(prev_sent);
+                let hangs_diff = stats.hangs.saturating_sub(prev_hangs);
+
+                // Decrease weight when hangs increased.
+                if hangs_diff > 0 {
+                    for _ in 0..hangs_diff {
+                        self.link_weights[id] *= 0.9;
+                    }
+                } else if sent_diff > 0 {
+                    // Gradually increase weight when link is active and stable.
+                    self.link_weights[id] = (self.link_weights[id] * 1.05).min(10.0);
+                }
+
+                // Clamp to a minimal value.
+                if self.link_weights[id] < 0.1 {
+                    self.link_weights[id] = 0.1;
+                }
+
+                self.last_stats[id] = (stats.total_sent, stats.hangs);
+            }
         }
     }
 

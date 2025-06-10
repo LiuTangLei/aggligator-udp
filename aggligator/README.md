@@ -48,7 +48,8 @@ The following [crates provide transports]:
   * [aggligator-transport-bluer] — transport over Bluetooth on Linux,
   * [aggligator-transport-tcp] — transport over TCP with optional TLS encryption,
   * [aggligator-transport-usb] — transport over USB for native platforms,
-  * [aggligator-transport-webusb] — transport over WebUSB for the web targeting WebAssembly, 
+  * [aggligator-transport-udp] — experimental UDP transport,
+  * [aggligator-transport-webusb] — transport over WebUSB for the web targeting WebAssembly,
   * [aggligator-transport-websocket] — transport over WebSockets for native platforms,
   * [aggligator-transport-websocket-web] — transport over WebSockets for the web targeting WebAssembly.
 
@@ -56,6 +57,7 @@ The following [crates provide transports]:
 [aggligator-transport-bluer]: https://crates.io/crates/aggligator-transport-bluer
 [aggligator-transport-tcp]: https://crates.io/crates/aggligator-transport-tcp
 [aggligator-transport-usb]: https://crates.io/crates/aggligator-transport-usb
+[aggligator-transport-udp]: https://crates.io/crates/aggligator-transport-udp
 [aggligator-transport-webusb]: https://crates.io/crates/aggligator-transport-webusb
 [aggligator-transport-websocket]: https://crates.io/crates/aggligator-transport-websocket
 [aggligator-transport-websocket-web]: https://crates.io/crates/aggligator-transport-websocket-web

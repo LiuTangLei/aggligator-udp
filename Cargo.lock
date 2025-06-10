@@ -87,6 +87,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "aggligator-transport-udp"
+version = "0.1.0"
+dependencies = [
+ "aggligator",
+ "async-trait",
+ "bytes",
+ "futures",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "aggligator-transport-usb"
 version = "0.3.1"
 dependencies = [
@@ -126,6 +139,7 @@ dependencies = [
  "aggligator-monitor",
  "aggligator-transport-bluer",
  "aggligator-transport-tcp",
+ "aggligator-transport-udp",
  "aggligator-transport-usb",
  "aggligator-transport-websocket",
  "aggligator-wrapper-tls",

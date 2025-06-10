@@ -13,7 +13,7 @@ This document contains the help content for the `agg-tunnel` command-line progra
 
 Forward TCP ports through a connection of aggregated links.
 
-This uses Aggligator to combine multiple TCP links into one connection, providing the combined speed and resilience to individual link faults.
+This uses Aggligator to combine multiple TCP or UDP links into one connection, providing the combined speed and resilience to individual link faults.
 
 **Usage:** `agg-tunnel [OPTIONS] <COMMAND>`
 
@@ -65,6 +65,7 @@ Tunnel client
 
 * `--tcp <TCP>` — TCP server name or IP addresses and port number
 * `--tcp-link-filter <TCP_LINK_FILTER>` — TCP link filter
+* `--udp <UDP>` — UDP server socket addresses
 
   Default value: `interface-interface`
 
@@ -84,6 +85,7 @@ Tunnel server
 
 * `-p`, `--port <PORT>` — Ports to forward to clients
 * `--tcp <TCP>` — TCP port to listen on
+* `--udp <UDP>` — UDP port to listen on
 
 
 

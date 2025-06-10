@@ -1,0 +1,19 @@
+[package]
+name = "aggligator-transport-udp"
+version = "0.1.0"
+description = "Aggligator transport: UDP"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+
+[dependencies]
+aggligator = { version = "0.9.4", path = "../aggligator" }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true, features = ["net"] }
+tokio-util = { workspace = true, features = ["net", "codec"] }
+bytes = { workspace = true }

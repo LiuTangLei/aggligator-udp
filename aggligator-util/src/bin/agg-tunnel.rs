@@ -32,6 +32,7 @@ use aggligator::{
 };
 use aggligator_monitor::monitor::{interactive_monitor, watch_tags};
 use aggligator_transport_tcp::{IpVersion, TcpAcceptor, TcpConnector, TcpLinkFilter};
+use aggligator_transport_udp::{UdpAcceptor, UdpConnector};
 use aggligator_util::{init_log, load_cfg, parse_tcp_link_filter, print_default_cfg};
 
 #[cfg(feature = "bluer")]
@@ -144,6 +145,9 @@ pub struct ClientCli {
     /// TCP server name or IP addresses and port number.
     #[arg(long)]
     tcp: Vec<String>,
+    /// UDP server socket addresses (ip:port).
+    #[arg(long)]
+    udp: Vec<std::net::SocketAddr>,
     /// TCP link filter.
     ///
     /// none: no link filtering.
@@ -191,6 +195,26 @@ impl ClientCli {
                 }
                 Err(err) => {
                     eprintln!("cannot use TCP target: {err}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let udp_connector = if !self.udp.is_empty() {
+            let addrs: Vec<_> = self.udp.clone();
+            match UdpConnector::new(addrs).await {
+                Ok(udp) => {
+                    targets.push(format!(
+                        "UDP {}",
+                        self.udp.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")
+                    ));
+                    watch_conn.push(Box::new(udp.clone()));
+                    Some(udp)
+                }
+                Err(err) => {
+                    eprintln!("cannot use UDP target: {err}");
                     None
                 }
             }
@@ -288,6 +312,7 @@ impl ClientCli {
             let disabled_tags_rx = disabled_tags_rx.clone();
             let port_cfg = cfg.clone();
             let tcp_connector = tcp_connector.clone();
+            let udp_connector = udp_connector.clone();
             #[cfg(feature = "bluer")]
             let rfcomm_connector = rfcomm_connector.clone();
             #[cfg(feature = "usb-host")]
@@ -307,6 +332,9 @@ impl ClientCli {
 
                     let mut connector = builder.build();
                     if let Some(c) = tcp_connector.clone() {
+                        connector.add(c);
+                    }
+                    if let Some(c) = udp_connector.clone() {
                         connector.add(c);
                     }
                     #[cfg(feature = "bluer")]
@@ -415,6 +443,9 @@ pub struct ServerCli {
     /// TCP port to listen on.
     #[arg(long)]
     tcp: Option<u16>,
+    /// UDP port to listen on.
+    #[arg(long)]
+    udp: Option<u16>,
     /// RFCOMM channel number to listen on.
     #[cfg(feature = "bluer")]
     #[arg(long)]
@@ -467,6 +498,16 @@ impl ServerCli {
                     acceptor.add(tcp);
                 }
                 Err(err) => eprintln!("Cannot listen on TCP port {port}: {err}"),
+            }
+        }
+
+        if let Some(port) = self.udp {
+            match UdpAcceptor::new([SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port)]).await {
+                Ok(udp) => {
+                    server_ports.push(format!("UDP {port}"));
+                    acceptor.add(udp);
+                }
+                Err(err) => eprintln!("Cannot listen on UDP port {port}: {err}"),
             }
         }
 
