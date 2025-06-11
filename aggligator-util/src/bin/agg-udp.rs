@@ -48,7 +48,7 @@ struct LinkStats {
     
     // 心跳包丢包统计 - 真正的丢包检测
     /// Heartbeat sequence number (递增)
-    heartbeat_seq: u64,
+    _heartbeat_seq: u64,
     /// Heartbeat packets sent count
     heartbeats_sent: u64,
     /// Heartbeat ACKs received count  
@@ -56,7 +56,7 @@ struct LinkStats {
     /// Last heartbeat sent time
     last_heartbeat_sent: Option<Instant>,
     /// RTT measurements from heartbeats
-    rtt_samples: Vec<Duration>,
+    _rtt_samples: Vec<Duration>,
     /// Calculated packet loss rate from heartbeats
     loss_rate: f64,
     /// Average RTT
@@ -73,11 +73,11 @@ impl Default for LinkStats {
             last_update: now,
             window_bytes: 0,
             window_start: now,
-            heartbeat_seq: 0,
+            _heartbeat_seq: 0,
             heartbeats_sent: 0,
             heartbeats_acked: 0,
             last_heartbeat_sent: None,
-            rtt_samples: Vec::new(),
+            _rtt_samples: Vec::new(),
             loss_rate: 0.0,
             avg_rtt: None,
         }
@@ -152,23 +152,23 @@ impl LinkStats {
     }
     
     /// 处理可能的端到端响应（如果应用有响应流量）
-    fn record_possible_response(&mut self) {
+    fn _record_possible_response(&mut self) {
         if let Some(sent_time) = self.last_heartbeat_sent {
             let rtt = sent_time.elapsed();
             
             // 只记录合理的RTT（<2秒）
             if rtt < Duration::from_secs(2) {
-                self.rtt_samples.push(rtt);
+                self._rtt_samples.push(rtt);
                 
                 // 保持最近5个RTT样本
-                if self.rtt_samples.len() > 5 {
-                    self.rtt_samples.remove(0);
+                if self._rtt_samples.len() > 5 {
+                    self._rtt_samples.remove(0);
                 }
                 
                 // 如果有真实RTT样本，优先使用
-                if !self.rtt_samples.is_empty() {
-                    let total: Duration = self.rtt_samples.iter().sum();
-                    self.avg_rtt = Some(total / self.rtt_samples.len() as u32);
+                if !self._rtt_samples.is_empty() {
+                    let total: Duration = self._rtt_samples.iter().sum();
+                    self.avg_rtt = Some(total / self._rtt_samples.len() as u32);
                 }
             }
         }

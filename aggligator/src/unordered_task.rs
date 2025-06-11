@@ -451,11 +451,11 @@ pub struct UnorderedLinkStats {
 #[derive(Debug)]
 pub struct UnorderedAggTask {
     /// Configuration
-    config: UnorderedCfg,
+    _config: UnorderedCfg,
     /// Channel for sending received data to application
     rx_channel: mpsc::UnboundedSender<ReceivedData>,
     /// Channel for receiving control messages
-    control_tx: mpsc::UnboundedSender<UnorderedControlMsg>,
+    _control_tx: mpsc::UnboundedSender<UnorderedControlMsg>,
     /// Active links
     links: Arc<RwLock<HashMap<LinkId, UnorderedLinkState>>>,
     /// Load balancer state
@@ -469,9 +469,9 @@ impl UnorderedAggTask {
         control_tx: mpsc::UnboundedSender<UnorderedControlMsg>,
     ) -> Self {
         Self {
-            config: config.clone(),
+            _config: config.clone(),
             rx_channel,
-            control_tx,
+            _control_tx: control_tx,
             links: Arc::new(RwLock::new(HashMap::new())),
             load_balancer: UnorderedLoadBalancer::new(config.load_balance, config.node_role),
         }
@@ -833,7 +833,7 @@ struct LinkMetrics {
     /// Receiving bandwidth (bytes/sec) - important for clients
     recv_bandwidth: f64,
     /// Last update timestamp
-    last_update: Instant,
+    _last_update: Instant,
 }
 
 impl UnorderedLoadBalancer {
@@ -858,7 +858,7 @@ impl UnorderedLoadBalancer {
                 avg_rtt: rtt.as_millis() as f64,
                 send_bandwidth: send_bytes_per_sec,
                 recv_bandwidth: recv_bytes_per_sec,
-                last_update: Instant::now(),
+                _last_update: Instant::now(),
             },
         );
     }
@@ -1049,7 +1049,7 @@ impl UnorderedLoadBalancer {
 
 /// 滑动窗口性能统计
 #[derive(Debug, Clone)]
-struct WindowedStats {
+pub struct WindowedStats {
     /// 时间窗口记录 (时间戳, 成功数, 失败数, 发送字节数)
     entries: VecDeque<(Instant, u64, u64, u64)>,
     /// 窗口大小
