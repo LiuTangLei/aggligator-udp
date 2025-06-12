@@ -237,7 +237,7 @@ impl UnorderedLinkState {
             successful_sends: Arc::new(AtomicU64::new(0)),
             failed_sends: Arc::new(AtomicU64::new(0)),
             is_healthy: true,
-            windowed_stats: Arc::new(RwLock::new(WindowedStats::new(Duration::from_secs(60)))),
+            windowed_stats: Arc::new(RwLock::new(WindowedStats::new(Duration::from_secs(10)))),
         }
     }
 

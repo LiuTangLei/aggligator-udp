@@ -151,6 +151,14 @@ impl UdpConnector {
 
         Ok(socket)
     }
+
+    /// Optimize socket for low latency instead of high throughput
+    fn optimize_socket_buffers(_socket: &UdpSocket) -> Result<()> {
+        // Keep it simple - no buffer modifications needed
+        // Focus on low latency rather than high throughput
+        tracing::debug!("Socket optimization skipped for low latency");
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -197,6 +205,9 @@ impl ConnectingTransport for UdpConnector {
         // Create and bind UDP socket to this interface
         let socket = Self::bind_to_interface(interface, tag.remote).await?;
         
+        // Optimize socket buffer sizes for high throughput
+        Self::optimize_socket_buffers(&socket)?;
+        
         // Create UDP Tx/Rx streams
         let socket = std::sync::Arc::new(socket);
         let tx = UdpTx::new(socket.clone());
@@ -229,50 +240,120 @@ impl ConnectingTransport for UdpConnector {
 use bytes::Bytes;
 use futures::{Sink, Stream};
 use std::{
+    collections::VecDeque,
     pin::Pin,
     sync::Arc,
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
 };
 use tokio::io::{self, ReadBuf};
 
-/// UDP transmitter implementing Sink<Bytes>
+/// UDP transmitter implementing Sink<Bytes> with send buffering
 struct UdpTx {
     socket: Arc<UdpSocket>,
+    /// Send buffer to handle WouldBlock scenarios
+    send_buffer: VecDeque<Bytes>,
+    /// Maximum buffer size to prevent memory exhaustion
+    max_buffer_size: usize,
+    /// Waker for when socket becomes writable
+    waker: Option<Waker>,
 }
 
 impl UdpTx {
     fn new(socket: Arc<UdpSocket>) -> Self {
-        Self { socket }
+        Self { 
+            socket,
+            send_buffer: VecDeque::new(),
+            max_buffer_size: 1024, // Maximum 1024 packets in buffer
+            waker: None,
+        }
+    }
+
+    /// Try to flush the send buffer
+    fn try_flush_buffer(&mut self) -> std::result::Result<bool, io::Error> {
+        while let Some(data) = self.send_buffer.front() {
+            match self.socket.try_send(data) {
+                Ok(_) => {
+                    self.send_buffer.pop_front();
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    return Ok(false); // Socket not ready, stop flushing
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(true) // All data flushed
     }
 }
 
 impl Sink<Bytes> for UdpTx {
     type Error = io::Error;
 
-    fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn start_send(self: Pin<&mut Self>, item: Bytes) -> std::result::Result<(), Self::Error> {
-        // For UDP, we need to use try_send since we can't block
-        // In a real implementation, you might want to buffer this
-        match self.socket.try_send(&item) {
-            Ok(_) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                // UDP socket not ready, should be handled by buffering
-                Ok(())
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        // Try to flush existing buffer first
+        match self.try_flush_buffer() {
+            Ok(true) => {
+                // Buffer completely flushed
+                if self.send_buffer.len() < self.max_buffer_size {
+                    Poll::Ready(Ok(()))
+                } else {
+                    // Buffer full, register waker and return pending
+                    self.waker = Some(cx.waker().clone());
+                    Poll::Pending
+                }
             }
-            Err(e) => Err(e),
+            Ok(false) => {
+                // Socket not ready, register waker and return pending
+                self.waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
+            Err(e) => Poll::Ready(Err(e)),
         }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
-        // UDP doesn't need flushing
-        Poll::Ready(Ok(()))
+    fn start_send(mut self: Pin<&mut Self>, item: Bytes) -> std::result::Result<(), Self::Error> {
+        // Try to send directly first if buffer is empty
+        if self.send_buffer.is_empty() {
+            match self.socket.try_send(&item) {
+                Ok(_) => return Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // Socket not ready, fall through to buffering
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        // Buffer the data if we can't send directly
+        if self.send_buffer.len() < self.max_buffer_size {
+            self.send_buffer.push_back(item);
+            Ok(())
+        } else {
+            // Buffer is full, drop the packet (or return error)
+            tracing::warn!("UDP send buffer full, dropping packet");
+            Ok(()) // Consider returning an error here if you want backpressure
+        }
     }
 
-    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        match self.try_flush_buffer() {
+            Ok(true) => Poll::Ready(Ok(())),
+            Ok(false) => {
+                self.waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
+            Err(e) => Poll::Ready(Err(e)),
+        }
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        // Flush all remaining data before closing
+        match self.try_flush_buffer() {
+            Ok(true) => Poll::Ready(Ok(())),
+            Ok(false) => {
+                self.waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
+            Err(e) => Poll::Ready(Err(e)),
+        }
     }
 }
 

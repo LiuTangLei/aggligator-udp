@@ -4,14 +4,78 @@
 //! trait using UDP sockets, enabling efficient unordered packet aggregation
 //! over UDP connections.
 
-use std::{fmt, io, net::SocketAddr, sync::Arc};
+use std::{
+    fmt, io, net::SocketAddr, 
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
 
-use tokio::net::UdpSocket;
+use tokio::{net::UdpSocket, sync::RwLock};
 use tracing::{debug, error, info};
 
 use aggligator::unordered_task::UnorderedLinkTransport;
 
 pub mod connector;
+
+/// Health monitoring statistics
+#[derive(Debug)]
+struct HealthStats {
+    last_successful_send: Option<Instant>,
+    last_successful_recv: Option<Instant>,
+    consecutive_failures: u64,
+    total_sends: AtomicU64,
+    total_failures: AtomicU64,
+}
+
+impl HealthStats {
+    fn new() -> Self {
+        Self {
+            last_successful_send: None,
+            last_successful_recv: None,
+            consecutive_failures: 0,
+            total_sends: AtomicU64::new(0),
+            total_failures: AtomicU64::new(0),
+        }
+    }
+
+    fn record_success(&mut self, is_send: bool) {
+        if is_send {
+            self.last_successful_send = Some(Instant::now());
+        } else {
+            self.last_successful_recv = Some(Instant::now());
+        }
+        self.consecutive_failures = 0;
+    }
+
+    fn record_failure(&mut self) {
+        self.consecutive_failures += 1;
+        self.total_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn is_healthy(&self) -> bool {
+        const MAX_CONSECUTIVE_FAILURES: u64 = 5;
+        const MAX_SILENCE_DURATION: Duration = Duration::from_secs(30);
+
+        // Check consecutive failures
+        if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+            return false;
+        }
+
+        // Check if we've had recent activity
+        let now = Instant::now();
+        let recent_send = self.last_successful_send
+            .map(|t| now.duration_since(t) < MAX_SILENCE_DURATION)
+            .unwrap_or(false);
+        let recent_recv = self.last_successful_recv
+            .map(|t| now.duration_since(t) < MAX_SILENCE_DURATION)
+            .unwrap_or(false);
+
+        recent_send || recent_recv
+    }
+}
 
 /// UDP transport implementation for unordered aggregation
 #[derive(Debug)]
@@ -22,6 +86,8 @@ pub struct UdpTransport {
     remote_addr: SocketAddr,
     /// Local address bound to the socket
     local_addr: SocketAddr,
+    /// Health monitoring statistics
+    health_stats: Arc<RwLock<HealthStats>>,
 }
 
 impl UdpTransport {
@@ -36,6 +102,7 @@ impl UdpTransport {
             socket: Arc::new(socket),
             remote_addr: "0.0.0.0:0".parse().unwrap(), // Will be set when connecting
             local_addr: actual_local_addr,
+            health_stats: Arc::new(RwLock::new(HealthStats::new())),
         })
     }
 
@@ -66,7 +133,12 @@ impl UdpTransport {
 
         info!("UDP transport auto-bound to {} -> {}", local_addr, remote_addr);
 
-        Ok(Self { socket: Arc::new(socket), remote_addr, local_addr })
+        Ok(Self { 
+            socket: Arc::new(socket), 
+            remote_addr, 
+            local_addr,
+            health_stats: Arc::new(RwLock::new(HealthStats::new())),
+        })
     }
 
     /// Get the UDP socket for this transport
@@ -83,6 +155,43 @@ impl UdpTransport {
     pub fn remote_addr(&self) -> SocketAddr {
         self.remote_addr
     }
+
+    /// Send multiple packets in batch for better performance
+    /// This method is prepared for future batch sending optimization
+    #[allow(dead_code)]
+    async fn send_batch(&self, packets: &[&[u8]]) -> Result<usize, std::io::Error> {
+        let mut total_bytes = 0;
+        let mut send_failures = 0;
+        
+        for packet in packets {
+            match self.socket.send(packet).await {
+                Ok(bytes_sent) => {
+                    total_bytes += bytes_sent;
+                }
+                Err(e) => {
+                    send_failures += 1;
+                    error!("UDP batch send failed for packet: {}", e);
+                    if send_failures > packets.len() / 2 {
+                        // If more than half fail, return error
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        
+        // Update health stats
+        let mut stats = self.health_stats.write().await;
+        if send_failures == 0 {
+            stats.record_success(true);
+        } else {
+            stats.record_failure();
+        }
+        stats.total_sends.fetch_add(packets.len() as u64, Ordering::Relaxed);
+        
+        debug!("UDP batch sent {} packets ({} bytes) with {} failures", 
+               packets.len(), total_bytes, send_failures);
+        Ok(total_bytes)
+    }
 }
 
 #[async_trait::async_trait]
@@ -92,10 +201,17 @@ impl UnorderedLinkTransport for UdpTransport {
         match self.socket.send(data).await {
             Ok(bytes_sent) => {
                 debug!("UDP sent {} bytes to {}", bytes_sent, self.remote_addr);
+                // Record successful send
+                let mut stats = self.health_stats.write().await;
+                stats.record_success(true);
+                stats.total_sends.fetch_add(1, Ordering::Relaxed);
                 Ok(bytes_sent)
             }
             Err(e) => {
                 error!("UDP send failed: {}", e);
+                // Record failure
+                let mut stats = self.health_stats.write().await;
+                stats.record_failure();
                 Err(e)
             }
         }
@@ -106,8 +222,9 @@ impl UnorderedLinkTransport for UdpTransport {
     }
 
     async fn is_healthy(&self) -> bool {
-        // Simple health check - try to get socket info
-        self.socket.local_addr().is_ok()
+        // Use our enhanced health checking
+        let stats = self.health_stats.read().await;
+        stats.is_healthy() && self.socket.local_addr().is_ok()
     }
 }
 

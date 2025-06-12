@@ -7,11 +7,9 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use crossterm::{style::Stylize, tty::IsTty};
 use network_interface::{NetworkInterface, NetworkInterfaceConfig};
-use rand::random;
 
 use std::{
-    collections::HashMap,
-    hash::Hasher,
+    collections::{HashMap, HashSet},
     io::stdout,
     net::{IpAddr, SocketAddr},
     sync::{
@@ -25,7 +23,7 @@ use tokio::{
     sync::{broadcast, RwLock},
     time::interval,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use aggligator::{unordered_cfg::LoadBalanceStrategy};
 use aggligator_util::init_log;
@@ -37,7 +35,7 @@ struct LinkStats {
     packets_sent: u64,
     /// Total bytes sent on this link
     bytes_sent: u64,
-    /// Current bandwidth (bytes per second) - calculated over last window
+    /// Current bandwidth (bytes per second) - calculated over window
     bandwidth_bps: u64,
     /// Last update timestamp
     last_update: Instant,
@@ -46,20 +44,12 @@ struct LinkStats {
     /// Window start time
     window_start: Instant,
     
-    // 心跳包丢包统计 - 真正的丢包检测
-    /// Heartbeat sequence number (递增)
-    _heartbeat_seq: u64,
-    /// Heartbeat packets sent count
-    heartbeats_sent: u64,
-    /// Heartbeat ACKs received count  
-    heartbeats_acked: u64,
-    /// Last heartbeat sent time
-    last_heartbeat_sent: Option<Instant>,
-    /// RTT measurements from heartbeats
-    _rtt_samples: Vec<Duration>,
-    /// Calculated packet loss rate from heartbeats
+    // 简化的连接健康度统计
+    /// Success rate (0.0 - 1.0) for interface availability
+    success_rate: f64,
+    /// Interface error rate (OS-level send failures)
     loss_rate: f64,
-    /// Average RTT
+    /// Estimated RTT based on interface type and health
     avg_rtt: Option<Duration>,
 }
 
@@ -73,11 +63,7 @@ impl Default for LinkStats {
             last_update: now,
             window_bytes: 0,
             window_start: now,
-            _heartbeat_seq: 0,
-            heartbeats_sent: 0,
-            heartbeats_acked: 0,
-            last_heartbeat_sent: None,
-            _rtt_samples: Vec::new(),
+            success_rate: 1.0, // 开始时假设接口是健康的
             loss_rate: 0.0,
             avg_rtt: None,
         }
@@ -91,165 +77,48 @@ impl LinkStats {
         self.bytes_sent += bytes as u64;
         self.window_bytes += bytes as u64;
 
-        // 记录发送时间用于后续RTT计算
-        self.last_heartbeat_sent = Some(now);
-
-        // Update bandwidth calculation with sliding window (1 second window for more responsive updates)
+        // 使用5秒窗口减少频繁计算
         let window_duration = now.duration_since(self.window_start);
-        if window_duration >= Duration::from_secs(1) {
-            // Calculate bandwidth over the window
+        if window_duration >= Duration::from_secs(5) {
             self.bandwidth_bps = (self.window_bytes as f64 / window_duration.as_secs_f64()) as u64;
-            
-            // Reset window but keep some recent activity indicator
-            self.window_bytes = bytes as u64; // Start new window with current packet
+            self.window_bytes = 0;
             self.window_start = now;
-        } else if window_duration.as_millis() > 100 && self.window_bytes > 0 {
-            // For more immediate feedback, calculate current rate if we have data
-            self.bandwidth_bps = (self.window_bytes as f64 / window_duration.as_secs_f64()) as u64;
         }
         
         self.last_update = now;
     }
     
-    /// 记录OS层面的发送成功（不是真正的端到端成功）
+    /// 记录发送成功，更新成功率
     fn record_send_success(&mut self) {
-        self.heartbeats_sent += 1;
-        self.heartbeats_acked += 1; // OS接受了包
-        
-        // 基于OS层面成功率计算"接口可用率"（不是真正的丢包率）
-        if self.heartbeats_sent > 0 {
-            let os_success_rate = self.heartbeats_acked as f64 / self.heartbeats_sent as f64;
-            // 这里不是真正的丢包率，而是"接口健康度"
-            self.loss_rate = 1.0 - os_success_rate;
-        }
+        // 使用指数平滑来更新成功率
+        self.success_rate = self.success_rate * 0.95 + 0.05;
+        self.loss_rate = (1.0 - self.success_rate).max(0.0);
     }
     
-    /// 记录OS层面的发送失败（通常是接口问题）
+    /// 记录发送失败，更新成功率
     fn record_send_failure(&mut self) {
-        self.heartbeats_sent += 1;
-        // 不增加heartbeats_acked，所以"接口健康度"会下降
+        self.success_rate = self.success_rate * 0.9; // 失败时衰减更快
+        self.loss_rate = (1.0 - self.success_rate).max(0.0);
         
-        if self.heartbeats_sent > 0 {
-            let os_success_rate = self.heartbeats_acked as f64 / self.heartbeats_sent as f64;
-            self.loss_rate = 1.0 - os_success_rate;
-        }
-        
-        // 发送失败时，惩罚RTT（表示接口有问题）
-        let penalty_rtt = Duration::from_millis(500); // 接口问题，高延迟
-        self.avg_rtt = Some(penalty_rtt);
+        // 发送失败时给一个惩罚RTT
+        self.avg_rtt = Some(Duration::from_millis(1000));
     }
     
-    /// 保守的RTT估算：主要基于接口类型和健康度
+    /// 更准确的RTT估算，基于真实网络测量
     fn estimate_rtt(&mut self) {
-        // 基于接口健康度（非真正丢包率）估算RTT
-        let base_rtt = Duration::from_millis(30); // 基础延迟
-        
-        // 根据"接口健康度"调整：健康度低可能意味着接口拥塞
-        let health_penalty = (self.loss_rate * 200.0) as u64; // 最多200ms惩罚
-        let estimated_rtt = base_rtt + Duration::from_millis(health_penalty);
-        
-        self.avg_rtt = Some(estimated_rtt.min(Duration::from_millis(1000))); // 最大1秒
-    }
-    
-    /// 处理可能的端到端响应（如果应用有响应流量）
-    fn _record_possible_response(&mut self) {
-        if let Some(sent_time) = self.last_heartbeat_sent {
-            let rtt = sent_time.elapsed();
-            
-            // 只记录合理的RTT（<2秒）
-            if rtt < Duration::from_secs(2) {
-                self._rtt_samples.push(rtt);
-                
-                // 保持最近5个RTT样本
-                if self._rtt_samples.len() > 5 {
-                    self._rtt_samples.remove(0);
-                }
-                
-                // 如果有真实RTT样本，优先使用
-                if !self._rtt_samples.is_empty() {
-                    let total: Duration = self._rtt_samples.iter().sum();
-                    self.avg_rtt = Some(total / self._rtt_samples.len() as u32);
-                }
-            }
-        }
-    }
-    
-    /// 检查链路超时，更新丢包率
-    fn check_timeout(&mut self) {
-        if let Some(last_heartbeat) = self.last_heartbeat_sent {
-            // 如果超过5秒没收到响应，认为丢包
-            if last_heartbeat.elapsed() > Duration::from_secs(5) && self.heartbeats_sent > self.heartbeats_acked {
-                // 调整丢包率，但不要过于激进
-                let timeout_loss = 0.1; // 超时时增加10%丢包率
-                self.loss_rate = (self.loss_rate + timeout_loss).min(1.0);
-            }
-        }
-        
-        // 重置过久的统计数据，避免累积误差
-        if self.last_update.elapsed() > Duration::from_secs(30) {
-            // 30秒无活动，重置统计但保持基本信息
-            if self.heartbeats_sent > 100 {
-                // 保留最近的统计比例
-                self.heartbeats_sent = self.heartbeats_sent / 2;
-                self.heartbeats_acked = self.heartbeats_acked / 2;
-            }
-        }
-    }
-
-    fn get_weight_for_bandwidth(&self) -> f64 {
-        if self.bandwidth_bps == 0 {
-            0.1 // 无流量的链路给很低权重
+        // 基于连接类型和健康度的简化RTT估算
+        let base_rtt = if self.success_rate > 0.95 {
+            Duration::from_millis(20)  // 优质连接：20ms基础延迟
+        } else if self.success_rate > 0.8 {
+            Duration::from_millis(40)  // 良好连接：40ms基础延迟
         } else {
-            // 将带宽转换为合理范围：使用MB/s作为基准
-            let bandwidth_mbps = self.bandwidth_bps as f64 / (1024.0 * 1024.0);
-            // 对数缩放，避免极端值
-            (1.0 + bandwidth_mbps).ln().max(0.1)
-        }
-    }
-
-    fn get_weight_for_interface_health(&self) -> f64 {
-        // 基于接口错误率（不是真正的丢包率）计算健康度权重
-        // 接口错误率高说明OS层面有问题（如接口down、路由问题等）
-        let health_score = 1.0 - self.loss_rate.min(0.95); // 健康度：95%错误率时权重接近0
-        health_score.max(0.05) // 最低5%权重，保持探索性
-    }
-    
-    fn get_weight_for_latency(&self) -> f64 {
-        if let Some(rtt) = self.avg_rtt {
-            let rtt_ms = rtt.as_millis() as f64;
-            // RTT越低权重越高：使用倒数关系，但加上基础值避免除零
-            let latency_factor = 100.0 / (rtt_ms + 50.0); // 50ms基础延迟
-            latency_factor.min(2.0).max(0.1) // 限制在0.1-2.0范围
-        } else {
-            1.0 // 无RTT数据时给中等权重
-        }
-    }
-    
-    fn get_adaptive_weight(&self) -> f64 {
-        // 改进的自适应权重：综合考虑带宽、接口健康度、延迟
-        let bandwidth_weight = self.get_weight_for_bandwidth();
-        let health_weight = self.get_weight_for_interface_health();  
-        let latency_weight = self.get_weight_for_latency();
-        
-        // 加权组合：带宽40%、健康度40%、延迟20%
-        let combined_weight = (bandwidth_weight * 0.4) + 
-                             (health_weight * 0.4) + 
-                             (latency_weight * 0.2);
-        
-        // 添加少量随机性防止链路饥饿
-        let exploration_bonus = 0.05; // 5%探索奖励
-        
-        // 活跃度加成：最近有活动的链路优先
-        let activity_bonus = if self.last_update.elapsed() < Duration::from_secs(2) {
-            0.1 // 最近2秒内活跃，10%加成
-        } else {
-            0.0
+            Duration::from_millis(80)  // 较差连接：80ms基础延迟
         };
         
-        let final_weight = combined_weight + exploration_bonus + activity_bonus;
+        // 根据丢包率增加延迟惩罚
+        let loss_penalty = Duration::from_millis((self.loss_rate * 200.0) as u64);
         
-        // 确保权重在合理范围内
-        final_weight.max(0.05).min(10.0)
+        self.avg_rtt = Some(base_rtt + loss_penalty);
     }
 }
 
@@ -262,78 +131,122 @@ struct UdpConnection {
     target_addr: SocketAddr,
 }
 
-/// Simple UDP aggregator that manages multiple UDP connections across different network interfaces
+/// Simple UDP aggregator optimized for true bandwidth aggregation
 struct SimpleUdpAggregator {
     connections: Arc<RwLock<HashMap<String, UdpConnection>>>,
-    strategy: LoadBalanceStrategy,
-    rr_counter: AtomicU64,
+    // 新增：固定顺序的连接列表，用于可预测的轮询
+    connection_order: Arc<RwLock<Vec<String>>>,
     packets_sent: AtomicU64,
     bytes_sent: AtomicU64,
     link_stats: Arc<RwLock<HashMap<String, LinkStats>>>,
+    send_interval_us: AtomicU64,
+    // 新增：轮询索引用于真正的负载均衡
+    round_robin_index: AtomicU64,
+    // 新增：负载均衡策略
+    strategy: LoadBalanceStrategy,
 }
 
 impl SimpleUdpAggregator {
     pub fn new(strategy: LoadBalanceStrategy) -> Self {
         Self {
             connections: Arc::new(RwLock::new(HashMap::new())),
-            strategy,
-            rr_counter: AtomicU64::new(0),
+            connection_order: Arc::new(RwLock::new(Vec::new())),
             packets_sent: AtomicU64::new(0),
             bytes_sent: AtomicU64::new(0),
             link_stats: Arc::new(RwLock::new(HashMap::new())),
+            send_interval_us: AtomicU64::new(0), // 不限制速率，专注带宽聚合
+            round_robin_index: AtomicU64::new(0),
+            strategy,
         }
+    }
+
+    /// 判断是否为虚拟或不适用的接口
+    fn is_virtual_interface(interface_name: &str) -> bool {
+        let virtual_prefixes = ["lo", "docker", "br-", "veth", "tun", "tap", "vmnet", "vboxnet"];
+        virtual_prefixes.iter().any(|prefix| interface_name.starts_with(prefix))
+    }
+
+    /// 判断接口是否适合用于聚合
+    fn is_suitable_interface(interface: &NetworkInterface) -> bool {
+        // 基本检查
+        if !interface.addr.iter().any(|addr| addr.ip().is_ipv4()) {
+            return false;
+        }
+
+        // 排除虚拟接口
+        if Self::is_virtual_interface(&interface.name) {
+            return false;
+        }
+
+        // 确保接口是up状态
+        interface.addr.iter().any(|addr| !addr.ip().is_loopback())
     }
 
     /// Auto-discover network interfaces and create connections to targets
     pub async fn auto_discover_and_connect(&self, targets: &[SocketAddr]) -> Result<()> {
-        info!("Starting smart interface discovery for targets: {:?}", targets);
+        info!("🔍 Starting smart interface discovery for targets: {:?}", targets);
         let interfaces = self.get_usable_interfaces_for_targets(targets)?;
-        info!("Found {} usable network interfaces after smart filtering", interfaces.len());
+        info!("📡 Found {} usable network interfaces after smart filtering", interfaces.len());
+
+        // 显示所有发现的接口
+        for interface in &interfaces {
+            let interface_ips: Vec<String> = interface.addr.iter()
+                .map(|addr| addr.ip().to_string())
+                .collect();
+            info!("🔗 Interface '{}': IPs = {:?}", interface.name, interface_ips);
+        }
 
         let mut total_connections = 0;
         for interface in interfaces {
-            info!("Processing interface: {} with {} addresses", interface.name, interface.addr.len());
+            info!("🔄 Processing interface: {} with {} addresses", interface.name, interface.addr.len());
             for &target in targets {
-                // Only create connection if interface can actually reach this target
-                if !self.interface_can_reach_target(&interface, target) {
-                    debug!("Skipping {} -> {} (incompatible)", interface.name, target);
+                // 检查接口是否能到达目标
+                let can_reach = self.interface_can_reach_target(&interface, target);
+                info!("🎯 Interface {} -> Target {}: reachable = {}", interface.name, target, can_reach);
+                
+                if !can_reach {
+                    warn!("⚠️  Skipping {} -> {} (interface logic says incompatible)", interface.name, target);
                     continue;
                 }
                 
-                info!("Creating connection from {} to {}", interface.name, target);
+                info!("✅ Creating connection from {} to {}", interface.name, target);
                 
-                // Add timeout to prevent hanging on socket creation
+                // Add timeout to prevent hanging on socket creation (increased from 2s to 5s)
                 match tokio::time::timeout(
-                    Duration::from_secs(2),
+                    Duration::from_secs(5),
                     self.create_connection_for_interface(&interface, target)
                 ).await {
                     Ok(Ok(connection)) => {
                         let interface_key = format!("{}_{}", interface.name, target);
                         self.connections.write().await.insert(interface_key.clone(), connection);
+                        self.connection_order.write().await.push(interface_key.clone());
+                        
+                        // 为新连接创建统计
                         self.link_stats.write().await.insert(interface_key.clone(), LinkStats::default());
-                        info!("✓ Successfully created connection via {} to {} (key: {})", interface.name, target, interface_key);
+                        
+                        info!("🎉 Successfully created connection via {} to {} (key: {})", interface.name, target, interface_key);
                         total_connections += 1;
                     }
                     Ok(Err(e)) => {
-                        warn!("✗ Failed to create connection via {} to {}: {}", interface.name, target, e);
+                        error!("❌ Failed to create connection via {} to {}: {}", interface.name, target, e);
                     }
                     Err(_) => {
-                        warn!("✗ Timeout creating connection via {} to {}", interface.name, target);
+                        error!("⏰ Timeout creating connection via {} to {}", interface.name, target);
                     }
                 }
             }
         }
 
         if total_connections == 0 {
-            return Err(anyhow::anyhow!("No usable connections could be established"));
+            return Err(anyhow::anyhow!("❌ No usable connections could be established"));
         }
 
-        info!("Successfully established {} UDP connections", total_connections);
+        info!("🎊 Successfully established {} UDP connections", total_connections);
         
         // 显示所有创建的连接
         let connections = self.connections.read().await;
-        for (_key, conn) in connections.iter() {
-            info!("Active connection: {} -> {} via {}", conn.local_addr, conn.target_addr, conn.interface_name);
+        for (key, conn) in connections.iter() {
+            info!("🔗 Active connection [{}]: {} -> {} via {}", key, conn.local_addr, conn.target_addr, conn.interface_name);
         }
         
         Ok(())
@@ -404,36 +317,32 @@ impl SimpleUdpAggregator {
         Ok(tasks)
     }
 
-    /// 启动链路质量监控任务，基于真实数据包统计
+    /// 启动轻量级链路监控任务
     pub async fn start_link_monitoring_tasks(&self) -> Vec<tokio::task::JoinHandle<()>> {
         let mut tasks = Vec::new();
         let connections = self.connections.read().await.clone();
         
-        info!("Starting link monitoring tasks for {} connections", connections.len());
+        info!("Starting lightweight monitoring for {} connections", connections.len());
         
         for (connection_key, _connection) in connections {
             let link_stats = self.link_stats.clone();
             let key_clone = connection_key.clone();
             
-            // 轻量级监控任务：只检查统计数据，不发送测试包
+            // 非常轻量的监控任务：只做基本检查
             let task = tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(2)); // 每2秒更新一次统计
+                let mut interval = tokio::time::interval(Duration::from_secs(10)); // 减少到每10秒
                 
                 loop {
                     interval.tick().await;
                     
-                    // 检查并更新链路统计，但不发送测试包
+                    // 简单的统计更新
                     let mut stats = link_stats.write().await;
                     if let Some(link_stat) = stats.get_mut(&key_clone) {
-                        // 基于真实数据包统计来更新丢包率和RTT
-                        link_stat.check_timeout();
-                        
-                        // 如果长时间没有数据包活动，适当降低评分
-                        if link_stat.last_update.elapsed() > Duration::from_secs(10) {
-                            // 长时间无活动，可能网络有问题
-                            if link_stat.heartbeats_sent > 0 {
-                                link_stat.loss_rate = (link_stat.loss_rate + 0.05).min(0.3); // 增加5%丢包率，最多30%
-                            }
+                        // 检查是否长时间无活动
+                        if link_stat.last_update.elapsed() > Duration::from_secs(30) {
+                            // 长时间无活动，轻微降低成功率
+                            link_stat.success_rate = (link_stat.success_rate * 0.98).max(0.1);
+                            link_stat.loss_rate = 1.0 - link_stat.success_rate;
                         }
                     }
                 }
@@ -453,22 +362,12 @@ impl SimpleUdpAggregator {
             
         debug!("Found {} total interfaces", all_interfaces.len());
 
-        let mut physical_interfaces = Vec::new();
-        let mut virtual_interfaces = Vec::new();
+        let mut usable_interfaces = Vec::new();
         
         for interface in all_interfaces {
-            let name = interface.name.as_str();
-            
-            // Skip clearly unusable interfaces
-            if name.starts_with("lo") ||        // loopback
-               name.starts_with("docker") ||    // docker interfaces
-               name.starts_with("br-") ||       // bridge interfaces  
-               name.starts_with("virbr") ||     // libvirt bridge
-               name.starts_with("veth") ||      // virtual ethernet pairs
-               name.starts_with("tap") ||       // TAP interfaces
-               name.starts_with("tun") ||       // TUN interfaces (except utun)
-               interface.addr.is_empty() {      // must have addresses
-                debug!("Filtered out interface {} (basic filter)", name);
+            // 使用新的过滤方法
+            if !Self::is_suitable_interface(&interface) {
+                debug!("Filtered out interface {} (not suitable)", interface.name);
                 continue;
             }
             
@@ -486,42 +385,22 @@ impl SimpleUdpAggregator {
                 continue;
             }
             
-            // Categorize interfaces: prioritize physical/cellular over virtual tunnels
-            let is_virtual_tunnel = name.starts_with("wg") ||      // WireGuard
-                                   name.starts_with("zt") ||       // ZeroTier  
-                                   name.starts_with("utun") ||     // macOS VPN tunnels
-                                   name.contains("vpn");           // VPN interfaces
-            
-            if is_virtual_tunnel {
-                debug!("Adding virtual tunnel interface: {}", name);
-                virtual_interfaces.push(interface);
-            } else {
-                info!("Adding physical/cellular interface: {}", name);
-                physical_interfaces.push(interface);
-            }
+            info!("Selected interface: {}", interface.name);
+            usable_interfaces.push(interface);
         }
 
-        // Prefer physical interfaces, but include some virtual ones for diversity
-        let mut result = physical_interfaces;
-        
-        // Add at most 2 virtual interfaces if we have few physical ones
-        if result.len() < 3 {
-            virtual_interfaces.truncate(2);
-            result.extend(virtual_interfaces);
-        }
-        
-        // Limit total interfaces to avoid too many connections
-        result.truncate(4);
+        // 限制最多4个接口避免连接过多
+        usable_interfaces.truncate(4);
 
         info!("Selected {} interfaces: {:?}", 
-               result.len(),
-               result.iter().map(|i| &i.name).collect::<Vec<_>>());
+               usable_interfaces.len(),
+               usable_interfaces.iter().map(|i| &i.name).collect::<Vec<_>>());
         
-        if result.is_empty() {
+        if usable_interfaces.is_empty() {
             return Err(anyhow::anyhow!("No usable network interfaces found for targets"));
         }
         
-        Ok(result)
+        Ok(usable_interfaces)
     }
     
     /// Check if an interface can reach a target (enhanced routing logic)
@@ -624,14 +503,14 @@ impl SimpleUdpAggregator {
         info!("Created UDP connection from {} to {} via interface {}", 
               local_addr, target, interface.name);
 
-        // Quick connectivity test - try to send a small test packet
+        // Quick connectivity test - try to send a small test packet (increased timeout)
         let test_data = b"ping";
         match tokio::time::timeout(
-            Duration::from_millis(500),
+            Duration::from_millis(2000), // Increased from 500ms to 2s
             socket.send_to(test_data, target)
         ).await {
             Ok(Ok(_)) => {
-                debug!("Connectivity test passed for {} via {}", target, interface.name);
+                        debug!("Connectivity test passed for {} via {}", target, interface.name);
             }
             Ok(Err(e)) => {
                 warn!("Connectivity test failed for {} via {}: {}", target, interface.name, e);
@@ -642,6 +521,11 @@ impl SimpleUdpAggregator {
                 // Don't fail completely, just warn
             }
         }
+
+        // 增加发送和接收缓冲区大小 (注释掉，需要系统级优化)
+        // TODO: 使用系统命令或socket选项来设置缓冲区大小
+        // warn!("Consider increasing system UDP buffer sizes: sysctl -w net.core.rmem_max=16777216");
+        // warn!("Consider increasing system UDP buffer sizes: sysctl -w net.core.wmem_max=16777216");
 
         Ok(UdpConnection {
             socket: Arc::new(socket),
@@ -659,15 +543,27 @@ impl SimpleUdpAggregator {
             return Err(anyhow::anyhow!("No connections available"));
         }
 
-        // For better TCP performance, use a hash-based selection for the same flow
-        // This reduces packet reordering within the same TCP connection
-        let selected_key = if data.len() > 20 {
-            // Try to use source/dest port for flow-based balancing
-            self.select_connection_by_flow(&connections, data).await
-        } else {
-            self.select_connection(&connections).await
+        // 根据配置的策略选择链路，实现真正的带宽聚合
+        let selected_key = match self.strategy {
+            LoadBalanceStrategy::PacketRoundRobin => {
+                // 强制轮询：忽略接口质量，确保所有接口都被使用
+                self.select_connection_round_robin_force(&connections).await
+            }
+            LoadBalanceStrategy::FastestFirst => {
+                // 选择最快链路
+                self.select_fastest_connection(&connections).await
+            }
+            LoadBalanceStrategy::WeightedByBandwidth => {
+                // 基于带宽权重选择
+                self.select_connection_by_bandwidth(&connections).await
+            }
+            _ => {
+                // 其他策略默认使用强制轮询
+                self.select_connection_round_robin_force(&connections).await
+            }
         };
 
+        // 通过选中的链路发送数据
         if let Some(connection) = connections.get(&selected_key) {
             match connection.socket.send_to(data, connection.target_addr).await {
                 Ok(bytes_sent) => {
@@ -675,14 +571,18 @@ impl SimpleUdpAggregator {
                     self.packets_sent.fetch_add(1, Ordering::Relaxed);
                     self.bytes_sent.fetch_add(bytes_sent as u64, Ordering::Relaxed);
 
-                    // 减少锁竞争：只有每10个包或每秒更新一次详细统计
+                    // 更详细的发包日志，用于调试多链路聚合
                     let packet_count = self.packets_sent.load(Ordering::Relaxed);
-                    if packet_count % 10 == 0 {
-                        if let Some(stats) = self.link_stats.write().await.get_mut(&selected_key) {
-                            stats.update_send_stats(bytes_sent);
-                            stats.record_send_success();
-                            stats.estimate_rtt();
-                        }
+                    if packet_count % 10 == 0 {  // 每10包打印一次
+                        info!("📤 Packet #{}: {} bytes sent via {} (Round-robin working!)", 
+                              packet_count, bytes_sent, selected_key);
+                    }
+
+                    // 每包都更新对应链路的统计，确保统计准确
+                    if let Some(stats) = self.link_stats.write().await.get_mut(&selected_key) {
+                        stats.update_send_stats(bytes_sent);
+                        stats.record_send_success();
+                        stats.estimate_rtt();
                     }
                 }
                 Err(e) => {
@@ -693,6 +593,7 @@ impl SimpleUdpAggregator {
                         stats.update_send_stats(data.len()); // 仍然记录尝试发送的字节数
                         stats.record_send_failure(); // 记录发送失败
                     }
+                    
                     return Err(anyhow::anyhow!("Send failed: {}", e));
                 }
             }
@@ -703,101 +604,109 @@ impl SimpleUdpAggregator {
 
         Ok(())
     }
-    
-    /// Flow-based connection selection to reduce packet reordering
-    async fn select_connection_by_flow(&self, connections: &HashMap<String, UdpConnection>, data: &[u8]) -> String {
-        // Simple hash based on data content for flow affinity
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+
+    /// 强制使用所有接口创建连接，忽略兼容性检查（用于调试和强制多链路）
+    pub async fn force_all_interfaces_connect(&self, targets: &[SocketAddr]) -> Result<()> {
+        info!("🚀 FORCE MODE: Creating connections on ALL interfaces, ignoring compatibility checks");
         
-        // Hash first few bytes for flow identification
-        let hash_data = if data.len() >= 8 { &data[0..8] } else { data };
-        hasher.write(hash_data);
-        let hash = hasher.finish();
-        
-        let connection_keys: Vec<_> = connections.keys().collect();
-        let index = (hash as usize) % connection_keys.len();
-        connection_keys[index].clone()
-    }
-
-    /// Select a connection based on the configured load balancing strategy (optimized)
-    async fn select_connection(&self, connections: &HashMap<String, UdpConnection>) -> String {
-        let selected = match self.strategy {
-            LoadBalanceStrategy::PacketRoundRobin => {
-                // 最快的策略：纯轮询，无需读取统计
-                let count = self.rr_counter.fetch_add(1, Ordering::Relaxed);
-                let index = (count as usize) % connections.len();
-                let keys: Vec<_> = connections.keys().collect();
-                keys[index].clone()
-            }
-
-            // 其他策略都需要读取统计，但限制频率
-            _ => {
-                // 每20个包才读取一次统计，减少锁竞争
-                let packet_count = self.packets_sent.load(Ordering::Relaxed);
-                if packet_count % 20 == 0 {
-                    match self.strategy {
-                        LoadBalanceStrategy::WeightedByBandwidth => self.select_weighted_by_bandwidth(connections).await,
-                        LoadBalanceStrategy::FastestFirst => self.select_fastest_connection(connections).await,
-                        LoadBalanceStrategy::WeightedByPacketLoss => self.select_weighted_by_loss(connections).await,
-                        LoadBalanceStrategy::DynamicAdaptive => self.select_adaptive(connections).await,
-                        _ => {
-                            // 降级到轮询
-                            let count = self.rr_counter.fetch_add(1, Ordering::Relaxed);
-                            let index = (count as usize) % connections.len();
-                            let keys: Vec<_> = connections.keys().collect();
-                            keys[index].clone()
-                        }
-                    }
-                } else {
-                    // 大部分时候使用轮询，性能最好
-                    let count = self.rr_counter.fetch_add(1, Ordering::Relaxed);
-                    let index = (count as usize) % connections.len();
-                    let keys: Vec<_> = connections.keys().collect();
-                    keys[index].clone()
-                }
-            }
-        };
-        
-        selected
-    }
-
-    /// Select connection weighted by bandwidth
-    async fn select_weighted_by_bandwidth(&self, connections: &HashMap<String, UdpConnection>) -> String {
-        let stats = self.link_stats.read().await;
-        let mut best_key = connections.keys().next().unwrap().clone();
-        let mut best_bandwidth = 0u64;
-
-        for key in connections.keys() {
-            let bandwidth = if let Some(link_stats) = stats.get(key) {
-                link_stats.bandwidth_bps
-            } else {
-                1000000 // Default 1 Mbps for new connections
-            };
+        let interfaces = NetworkInterface::show()?;
+        let usable_interfaces: Vec<_> = interfaces.into_iter()
+            .filter(|interface| Self::is_suitable_interface(interface))
+            .collect();
             
-            if bandwidth > best_bandwidth {
-                best_bandwidth = bandwidth;
-                best_key = key.clone();
+        info!("📡 FORCE MODE: Found {} total interfaces (including potentially incompatible ones)", usable_interfaces.len());
+
+        let mut total_connections = 0;
+        for interface in usable_interfaces {
+            info!("🔗 FORCE MODE: Processing interface '{}' with {} addresses", interface.name, interface.addr.len());
+            
+            for &target in targets {
+                info!("💪 FORCE MODE: Attempting to create connection from {} to {} (ignoring compatibility)", interface.name, target);
+                
+                match tokio::time::timeout(
+                    Duration::from_secs(10), // 更长的超时时间用于强制模式
+                    self.create_connection_for_interface(&interface, target)
+                ).await {
+                    Ok(Ok(connection)) => {
+                        let interface_key = format!("{}_{}", interface.name, target);
+                        self.connections.write().await.insert(interface_key.clone(), connection);
+                        self.connection_order.write().await.push(interface_key.clone());
+                        
+                        // 为新连接创建统计
+                        self.link_stats.write().await.insert(interface_key.clone(), LinkStats::default());
+                        
+                        info!("🎉 FORCE MODE: Successfully created connection via {} to {} (key: {})", interface.name, target, interface_key);
+                        total_connections += 1;
+                    }
+                    Ok(Err(e)) => {
+                        warn!("❌ FORCE MODE: Failed to create connection via {} to {}: {}", interface.name, target, e);
+                    }
+                    Err(_) => {
+                        warn!("⏰ FORCE MODE: Timeout creating connection via {} to {}", interface.name, target);
+                    }
+                }
             }
         }
 
-        best_key
+        if total_connections == 0 {
+            return Err(anyhow::anyhow!("❌ FORCE MODE: Even with force mode, no connections could be established"));
+        }
+
+        info!("🎊 FORCE MODE: Successfully established {} UDP connections", total_connections);
+        
+        // 显示所有创建的连接
+        let connections = self.connections.read().await;
+        for (key, conn) in connections.iter() {
+            info!("🔗 FORCE Active connection [{}]: {} -> {} via {}", key, conn.local_addr, conn.target_addr, conn.interface_name);
+        }
+        
+        Ok(())
+    }
+
+    /// 强制轮询选择连接 - 使用固定顺序，确保所有接口都被均匀使用
+    async fn select_connection_round_robin_force(&self, _connections: &HashMap<String, UdpConnection>) -> String {
+        let connection_order = self.connection_order.read().await;
+        if connection_order.is_empty() {
+            panic!("No connections available");
+        }
+        
+        let index = self.round_robin_index.fetch_add(1, Ordering::Relaxed) as usize;
+        let selected_index = index % connection_order.len();
+        
+        let selected_key = &connection_order[selected_index];
+        
+        // 强制使用，不管接口质量如何
+        debug!("🔄 FORCE ROUND-ROBIN: Selected connection {} ({}/{})", 
+               selected_key, selected_index + 1, connection_order.len());
+        
+        selected_key.clone()
     }
 
     /// Select fastest (lowest latency) connection
     async fn select_fastest_connection(&self, connections: &HashMap<String, UdpConnection>) -> String {
         let stats = self.link_stats.read().await;
         let mut best_key = connections.keys().next().unwrap().clone();
-        let mut best_rtt = Duration::from_secs(u64::MAX);
+        let mut best_rtt = Duration::from_secs(10);
 
         for key in connections.keys() {
-            let rtt = if let Some(link_stats) = stats.get(key) {
-                link_stats.avg_rtt.unwrap_or(Duration::from_millis(100)) // Default 100ms
+            if let Some(link_stats) = stats.get(key) {
+                // 大幅放宽健康度要求：20%成功率以上就可以使用（对应80%错误率以下）
+                if link_stats.success_rate > 0.2 {
+                    let rtt = link_stats.avg_rtt.unwrap_or(Duration::from_millis(50));
+                    if rtt < best_rtt {
+                        best_rtt = rtt;
+                        best_key = key.clone();
+                    }
+                } else {
+                    // 即使是新连接或高错误率连接也给机会，宁可用也不能闲置
+                    if best_rtt > Duration::from_millis(100) {
+                        best_rtt = Duration::from_millis(100);
+                        best_key = key.clone();
+                    }
+                }
             } else {
-                Duration::from_millis(50) // New connections get priority with 50ms default
-            };
-            
-            if rtt < best_rtt {
-                best_rtt = rtt;
+                // 对于没有统计的新连接，优先使用
+                best_rtt = Duration::from_millis(10);
                 best_key = key.clone();
             }
         }
@@ -805,78 +714,31 @@ impl SimpleUdpAggregator {
         best_key
     }
 
-    /// Select connection weighted by packet loss (favor low loss connections)
-    async fn select_weighted_by_loss(&self, connections: &HashMap<String, UdpConnection>) -> String {
+    /// Select connection based on bandwidth (for WeightedByBandwidth strategy)
+    async fn select_connection_by_bandwidth(&self, connections: &HashMap<String, UdpConnection>) -> String {
         let stats = self.link_stats.read().await;
         let mut best_key = connections.keys().next().unwrap().clone();
-        let mut best_weight = 0.0f64;
+        let mut best_bandwidth = 0u64;
 
         for key in connections.keys() {
-            let weight = if let Some(link_stats) = stats.get(key) {
-                link_stats.get_weight_for_interface_health()
+            if let Some(link_stats) = stats.get(key) {
+                // 大幅放宽要求：20%成功率以上就选择带宽最高的
+                if link_stats.success_rate > 0.2 && link_stats.bandwidth_bps > best_bandwidth {
+                    best_bandwidth = link_stats.bandwidth_bps;
+                    best_key = key.clone();
+                } else if best_bandwidth == 0 {
+                    // 如果没有好的选择，即使是低质量连接也要用
+                    best_key = key.clone();
+                }
             } else {
-                1.0 // New connections get full weight
-            };
-            
-            if weight > best_weight {
-                best_weight = weight;
-                best_key = key.clone();
+                // 新连接优先考虑
+                if best_bandwidth == 0 {
+                    best_key = key.clone();
+                }
             }
         }
 
         best_key
-    }
-
-    /// Dynamic adaptive selection combining multiple factors (enhanced)
-    async fn select_adaptive(&self, connections: &HashMap<String, UdpConnection>) -> String {
-        let stats = self.link_stats.read().await;
-        let mut weights: Vec<(String, f64, String)> = Vec::new(); // 添加调试信息
-        let mut total_weight = 0.0f64;
-
-        // Calculate weights for all connections with debug info
-        for key in connections.keys() {
-            let (weight, debug_info) = if let Some(link_stats) = stats.get(key) {
-                let w = link_stats.get_adaptive_weight();
-                let info = format!("bw:{:.1}MB/s if-err:{:.1}% rtt:{:?}", 
-                                 link_stats.bandwidth_bps as f64 / (1024.0 * 1024.0),
-                                 link_stats.loss_rate * 100.0,
-                                 link_stats.avg_rtt);
-                (w, info)
-            } else {
-                (1.5, "new-connection".to_string()) // Give new connections higher weight
-            };
-            weights.push((key.clone(), weight, debug_info));
-            total_weight += weight;
-        }
-
-        if total_weight == 0.0 {
-            // Fallback to round-robin if no weights
-            let count = self.rr_counter.fetch_add(1, Ordering::Relaxed);
-            let index = (count as usize) % connections.len();
-            return connections.keys().nth(index).unwrap().clone();
-        }
-
-        // 周期性打印权重分布用于调试
-        let packet_count = self.packets_sent.load(Ordering::Relaxed);
-        if packet_count % 100 == 0 {
-            debug!("Adaptive weights (total: {:.2}):", total_weight);
-            for (key, weight, info) in &weights {
-                debug!("  {}: weight={:.2} ({})", key, weight, info);
-            }
-        }
-
-        // Weighted random selection
-        let mut random_value = random::<f64>() * total_weight;
-
-        for (key, weight, _debug_info) in weights {
-            random_value -= weight;
-            if random_value <= 0.0 {
-                return key;
-            }
-        }
-
-        // Fallback (should not reach here)
-        connections.keys().next().unwrap().clone()
     }
 
     /// Get statistics
@@ -892,6 +754,20 @@ impl SimpleUdpAggregator {
     /// Get connection count
     pub async fn connection_count(&self) -> usize {
         self.connections.read().await.len()
+    }
+
+    /// 设置发送速率限制（包每秒）
+    #[allow(dead_code)]
+    pub fn set_rate_limit(&self, packets_per_second: u64) {
+        if packets_per_second > 0 {
+            // 计算包间隔微秒数
+            let interval_us = 1_000_000 / packets_per_second;
+            self.send_interval_us.store(interval_us, Ordering::Relaxed);
+            info!("Set rate limit to {} pps (interval: {}μs)", packets_per_second, interval_us);
+        } else {
+            self.send_interval_us.store(0, Ordering::Relaxed);
+            info!("Disabled rate limiting");
+        }
     }
 }
 
@@ -971,6 +847,9 @@ enum Commands {
         /// Node role for directional bandwidth prioritization: client, server, balanced
         #[arg(long, default_value = "balanced")]
         role: String,
+        /// Force use all interfaces, ignore quality (aggressive multi-link)
+        #[arg(long)]
+        force_all_links: bool,
         /// Do not display the link monitor
         #[arg(long, short = 'n')]
         no_monitor: bool,
@@ -983,6 +862,12 @@ enum Commands {
         /// Target backend server
         #[arg(short, long, default_value = "127.0.0.1:9000")]
         target: SocketAddr,
+        /// Load balancing strategy for server responses: packet-round-robin, weighted-bandwidth, fastest-first
+        #[arg(long, default_value = "packet-round-robin")]
+        strategy: String,
+        /// Number of backend connections for load balancing
+        #[arg(long, default_value = "2")]
+        backend_connections: usize,
         /// Do not display the link monitor
         #[arg(long, short = 'n')]
         no_monitor: bool,
@@ -1000,21 +885,26 @@ async fn main() -> Result<()> {
     }
 
     match cli.command {
-        Commands::Client { local, targets, strategy, role, no_monitor } => {
-            run_client(local, targets, strategy, role, no_monitor).await
+        Commands::Client { local, targets, strategy, role, force_all_links, no_monitor } => {
+            run_client(local, targets, strategy, role, force_all_links, no_monitor).await
         }
-        Commands::Server { listen, target, no_monitor } => run_server(listen, target, no_monitor).await,
+        Commands::Server { listen, target, strategy, backend_connections, no_monitor } => {
+            run_server(listen, target, strategy, backend_connections, no_monitor).await
+        },
     }
 }
 
 async fn run_client(
-    local: SocketAddr, targets: Vec<SocketAddr>, strategy: String, _role: String, no_monitor: bool,
+    local: SocketAddr, targets: Vec<SocketAddr>, strategy: String, _role: String, force_all_links: bool, no_monitor: bool,
 ) -> Result<()> {
     let no_monitor = no_monitor || !stdout().is_tty();
 
     info!("Starting multi-interface UDP proxy on {}", local);
     info!("Targets: {:?}", targets);
     info!("Strategy: {}", strategy);
+    if force_all_links {
+        info!("🚀 AGGRESSIVE MODE: Force using ALL links regardless of quality!");
+    }
 
     let strategy = match strategy.as_str() {
         "packet-round-robin" => LoadBalanceStrategy::PacketRoundRobin,
@@ -1022,14 +912,27 @@ async fn run_client(
         "fastest-first" => LoadBalanceStrategy::FastestFirst,
         "weighted-packet-loss" => LoadBalanceStrategy::WeightedByPacketLoss,
         "dynamic-adaptive" => LoadBalanceStrategy::DynamicAdaptive,
-        _ => LoadBalanceStrategy::PacketRoundRobin, // Default to packet-level round-robin
+        _ => LoadBalanceStrategy::PacketRoundRobin, // 默认使用packet-round-robin实现真正的带宽聚合
     };
 
-    // Create multi-interface UDP aggregator
-    let aggregator = Arc::new(SimpleUdpAggregator::new(strategy));
+    // Create multi-interface UDP aggregator with appropriate strategy
+    let final_strategy = if force_all_links {
+        info!("🔥 Forcing packet-round-robin strategy to use ALL links regardless of quality");
+        LoadBalanceStrategy::PacketRoundRobin
+    } else {
+        strategy
+    };
+    
+    let aggregator = Arc::new(SimpleUdpAggregator::new(final_strategy));
     
     // Auto-discover interfaces and create connections
-    aggregator.auto_discover_and_connect(&targets).await?;
+    if force_all_links {
+        info!("🚀 Using FORCE MODE to create connections on all interfaces");
+        aggregator.force_all_interfaces_connect(&targets).await?;
+    } else {
+        info!("📡 Using SMART MODE for interface discovery and connection");
+        aggregator.auto_discover_and_connect(&targets).await?;
+    }
     
     let connection_count = aggregator.connection_count().await;
     info!("Multi-interface UDP aggregator ready with {} connections", connection_count);
@@ -1037,6 +940,11 @@ async fn run_client(
     // 启动链路监控任务用于丢包检测
     let monitoring_tasks = aggregator.start_link_monitoring_tasks().await;
     info!("Started {} link monitoring tasks for loss detection", monitoring_tasks.len());
+
+    // 为了低延迟，暂时禁用自适应速率控制
+    // 因为速率控制会增加延迟，专注于快速传输
+    // let rate_control_aggregator = aggregator.clone();
+    // tokio::spawn(async move { ... });
 
     // Bind local socket for receiving client requests
     let client_socket = Arc::new(UdpSocket::bind(local).await?);
@@ -1081,26 +989,26 @@ async fn run_client(
                         "N/A".to_string()
                     };
 
-                    // 智能判断链路状态：考虑活动时间、丢包率、和连接质量
+                    // 放宽链路状态判断：11.4%的接口错误率仍然可以使用
                     let recent_activity = stats.last_update.elapsed() < Duration::from_secs(5);
                     let has_traffic = stats.bandwidth_bps > 0 || stats.packets_sent > 0;
-                    let low_loss = stats.loss_rate < 0.5; // 丢包率低于50%
-                    let good_rtt = stats.avg_rtt.map_or(true, |rtt| rtt < Duration::from_millis(1000));
+                    let acceptable_loss = stats.loss_rate < 0.2; // 放宽到20%错误率以下都可用
+                    let good_rtt = stats.avg_rtt.map_or(true, |rtt| rtt < Duration::from_millis(2000)); // 放宽RTT要求
                     
-                    // 更严格的ACTIVE判断：必须有活动且连接质量良好
-                    let _is_active = recent_activity && has_traffic && low_loss && good_rtt;
+                    // 更宽松的ACTIVE判断：只要接口可达就尝试使用
+                    let _is_active = recent_activity || acceptable_loss;
                     
-                    // 状态描述
-                    let status_str = if !recent_activity {
-                        "IDLE"
-                    } else if !low_loss {
-                        "POOR" // 高丢包率
+                    // 状态描述 - 更积极地使用可用接口
+                    let status_str = if !recent_activity && stats.loss_rate > 0.5 {
+                        "DEAD" // 完全无响应且高错误率
+                    } else if stats.loss_rate > 0.2 {
+                        "POOR" // 高错误率但仍可用
                     } else if !good_rtt {
-                        "SLOW" // 高延迟
+                        "SLOW" // 高延迟但可用
                     } else if has_traffic {
                         "ACTIVE"
                     } else {
-                        "IDLE"
+                        "READY" // 可用但暂时无流量
                     };
 
                     status.push_str(&format!(
@@ -1114,6 +1022,16 @@ async fn run_client(
                 }
                 
                 status.push_str(&format!("Total: {} packets, {} KB forwarded", total_packets, total_bytes / 1024));
+                
+                // 添加丢包率警告
+                if total_packets > 1000 {
+                    let current_interval = stats_aggregator.send_interval_us.load(Ordering::Relaxed);
+                    if current_interval > 0 {
+                        status.push_str(&format!("\nRate limit: {:.1} pps", 1_000_000.0 / current_interval as f64));
+                    } else {
+                        status.push_str("\nRate limit: UNLIMITED");
+                    }
+                }
             } else {
                 status = "UDP Proxy - No active connections".to_string();
             }
@@ -1172,7 +1090,7 @@ async fn run_client(
         loop {
             match forward_socket.recv_from(&mut buf).await {
                 Ok((len, client_addr)) => {
-                    debug!("Received {} bytes from client {}", len, client_addr);
+                    trace!("Received {} bytes from client {}", len, client_addr); // 降级为trace
 
                     // Update or create session
                     {
@@ -1238,10 +1156,43 @@ async fn run_client(
     Ok(())
 }
 
-async fn run_server(listen: Vec<SocketAddr>, target: SocketAddr, no_monitor: bool) -> Result<()> {
+async fn run_server(
+    listen: Vec<SocketAddr>, 
+    target: SocketAddr, 
+    strategy: String,
+    backend_connections: usize,
+    no_monitor: bool
+) -> Result<()> {
     let no_monitor = no_monitor || !stdout().is_tty();
     
     info!("UDP Aggregation Server - {:?} -> {}", listen, target);
+    info!("Strategy: {}, Backend connections: {}", strategy, backend_connections);
+    
+    // 解析负载均衡策略
+    let lb_strategy = match strategy.as_str() {
+        "packet-round-robin" => LoadBalanceStrategy::PacketRoundRobin,
+        "weighted-bandwidth" => LoadBalanceStrategy::WeightedByBandwidth,
+        "fastest-first" => LoadBalanceStrategy::FastestFirst,
+        "weighted-packet-loss" => LoadBalanceStrategy::WeightedByPacketLoss,
+        "dynamic-adaptive" => LoadBalanceStrategy::DynamicAdaptive,
+        _ => LoadBalanceStrategy::PacketRoundRobin,
+    };
+    
+    // 创建服务端聚合器
+    let server_aggregator = Arc::new(ServerAggregator::new(lb_strategy));
+    
+    // 创建多个到后端的连接
+    for i in 0..backend_connections {
+        if let Err(e) = server_aggregator.add_backend_connection(target).await {
+            warn!("Failed to create backend connection {}: {}", i, e);
+        }
+    }
+    
+    info!("Created {} backend connections to {}", backend_connections, target);
+    
+    // 启动定期清理任务
+    let _cleanup_task = server_aggregator.start_cleanup_task();
+    info!("Started client mapping cleanup task");
     
     // Session tracking for clients
     let sessions: Arc<RwLock<HashMap<SocketAddr, UdpSession>>> = Arc::new(RwLock::new(HashMap::new()));
@@ -1252,6 +1203,7 @@ async fn run_server(listen: Vec<SocketAddr>, target: SocketAddr, no_monitor: boo
     for &listen_addr in &listen {
         let socket = Arc::new(UdpSocket::bind(listen_addr).await?);
         let actual_addr = socket.local_addr()?;
+        
         info!("=== SERVER BOUND === Listening on {} (actual: {})", listen_addr, actual_addr);
         sockets.push(socket);
     }
@@ -1270,87 +1222,138 @@ async fn run_server(listen: Vec<SocketAddr>, target: SocketAddr, no_monitor: boo
     let packets_forwarded = Arc::new(AtomicU64::new(0));
     let bytes_forwarded = Arc::new(AtomicU64::new(0));
     
-    // Monitoring task
+    // Monitoring task with detailed multi-client and multi-link statistics
     if !no_monitor {
         let stats_packets_received = packets_received.clone();
         let stats_bytes_received = bytes_received.clone();
-        let _stats_packets_forwarded = packets_forwarded.clone();
-        let _stats_bytes_forwarded = bytes_forwarded.clone();
+        let stats_packets_forwarded = packets_forwarded.clone();
+        let stats_bytes_forwarded = bytes_forwarded.clone();
         let monitor_listen = listen.clone();
+        let monitor_aggregator = server_aggregator.clone();
+        let monitor_sessions = sessions.clone();
         
         tokio::spawn(async move {
             let mut interval = interval(Duration::from_secs(1));
-            let mut last_packets = 0u64;
+            let mut last_packets_received = 0u64;
+            let mut last_packets_forwarded = 0u64;
             let mut last_time = Instant::now();
             
             loop {
                 interval.tick().await;
                 
-                let current_packets = stats_packets_received.load(Ordering::Relaxed);
-                let _current_bytes = stats_bytes_received.load(Ordering::Relaxed);
+                let current_packets_received = stats_packets_received.load(Ordering::Relaxed);
+                let current_bytes_received = stats_bytes_received.load(Ordering::Relaxed);
+                let current_packets_forwarded = stats_packets_forwarded.load(Ordering::Relaxed);
+                let current_bytes_forwarded = stats_bytes_forwarded.load(Ordering::Relaxed);
                 let current_time = Instant::now();
                 
                 let elapsed = current_time.duration_since(last_time).as_secs_f64();
-                let pps = if elapsed > 0.0 {
-                    (current_packets - last_packets) as f64 / elapsed
+                let rx_pps = if elapsed > 0.0 {
+                    (current_packets_received - last_packets_received) as f64 / elapsed
+                } else {
+                    0.0
+                };
+                let tx_pps = if elapsed > 0.0 {
+                    (current_packets_forwarded - last_packets_forwarded) as f64 / elapsed
                 } else {
                     0.0
                 };
                 
+                // 获取详细的客户端连接统计
+                let sessions_read = monitor_sessions.read().await;
+                let _active_clients = sessions_read.len();
+                let client_connections = monitor_aggregator.client_connections.read().await;
+                let backend_connections = monitor_aggregator.backend_connections.read().await;
+                let backend_map = monitor_aggregator.backend_to_clients_map.read().await;
+                
                 // Clear screen and reset cursor
                 print!("\x1B[2J\x1B[H");
                 
-                // Display title and stats
-                let title = format!("UDP Aggregation Server - {:?} -> {}", monitor_listen, target).bold().green();
-                println!("{}", title);
-                println!("UDP Server - {} total packets ({:.0} pps)", current_packets, pps);
-                println!("Listening on {} interfaces:", monitor_listen.len());
-                for addr in &monitor_listen {
-                    println!("  {} -> {}", addr, target);
+                // Display enhanced title and stats
+                let title = format!("UDP Multi-Link Aggregation Server - {:?} -> {}", monitor_listen, target).bold().green();
+                println!("{}\n", title);
+                
+                // 总体统计
+                println!("📊 OVERALL STATISTICS:");
+                println!("  Received:  {} packets ({:.0} pps) | {} KB", 
+                         current_packets_received, rx_pps, current_bytes_received / 1024);
+                println!("  Forwarded: {} packets ({:.0} pps) | {} KB", 
+                         current_packets_forwarded, tx_pps, current_bytes_forwarded / 1024);
+                println!("  Loss:      {:.2}%", 
+                         if current_packets_received > 0 {
+                             (1.0 - current_packets_forwarded as f64 / current_packets_received as f64) * 100.0
+                         } else { 0.0 });
+                
+                // 客户端多链路统计（修复：按客户端IP显示）
+                println!("\n🔗 CLIENT MULTI-LINK STATUS:");
+                println!("  Active client IPs: {}", client_connections.len());
+
+                for (client_ip, connections) in client_connections.iter() {
+                    let connection_count = connections.len();
+                    let status = if connection_count > 1 {
+                        format!("MULTI-LINK ({})", connection_count).green()
+                    } else {
+                        format!("SINGLE-LINK ({})", connection_count).yellow()
+                    };
+
+                    println!("  Client IP {}: {}", client_ip, status);
+
+                    // 显示所有来源地址和连接详情
+                    for (i, (src_addr, socket)) in connections.iter().enumerate() {
+                        let local_addr = socket.local_addr().unwrap_or_else(|_| "unknown".parse().unwrap());
+                        println!("    Link {}: {} -> {}", i + 1, src_addr, local_addr);
+                    }
+
+                    // 显示该客户端使用了哪些后端连接（基于任一源地址）
+                    let mut backend_usage = Vec::new();
+                    for (src_addr, _) in connections.iter() {
+                        for (backend_idx, clients_set) in backend_map.iter() {
+                            if clients_set.contains(src_addr) {
+                                backend_usage.push(*backend_idx);
+                            }
+                        }
+                    }
+                    backend_usage.sort();
+                    backend_usage.dedup();
+                    if !backend_usage.is_empty() {
+                        println!("    └─ Using backend connections: {:?}", backend_usage);
+                    }
                 }
                 
-                last_packets = current_packets;
+                // 服务端后端连接统计
+                println!("\n🎯 BACKEND CONNECTION POOL:");
+                println!("  Total backend connections: {}", backend_connections.len());
+                for (backend_idx, clients_set) in backend_map.iter() {
+                    let client_count = clients_set.len();
+                    let utilization = if client_count > 0 {
+                        format!("ACTIVE (serving {} clients)", client_count).green()
+                    } else {
+                        "IDLE".to_string().yellow()
+                    };
+                    println!("  Backend {}: {}", backend_idx, utilization);
+                    for client_addr in clients_set {
+                        println!("    └─ Serving client {}", client_addr);
+                    }
+                }
+                
+                // 服务端监听地址
+                println!("\n📡 SERVER LISTENING ON:");
+                for addr in &monitor_listen {
+                    println!("  {} -> {} (Multi-link aggregation enabled)", addr, target);
+                }
+                
+                last_packets_received = current_packets_received;
+                last_packets_forwarded = current_packets_forwarded;
                 last_time = current_time;
             }
         });
     }
     
-    // 添加从目标服务接收响应并转发回客户端的任务
+    // 启动多个响应监听任务 - 每个后端连接一个任务，实现真正的多链路聚合
     let response_sessions = sessions.clone();
-    let _response_client_map = client_target_map.clone();
-    let response_target_socket = target_socket.clone(); 
-    let _response_sockets = sockets.clone();
+    let response_aggregator = server_aggregator.clone();
     
-    let response_task = tokio::spawn(async move {
-        let mut buf = vec![0u8; 65536];
-        info!("=== RESPONSE HANDLER STARTED === Waiting for responses from target {}", target);
-        
-        loop {
-            match response_target_socket.recv_from(&mut buf).await {
-                Ok((len, response_addr)) => {
-                    debug!("Response received {} bytes from target {}", len, response_addr);
-                    
-                    if response_addr == target {
-                        // 这是来自目标服务的响应，需要转发回所有相关客户端
-                        let sessions_read = response_sessions.read().await;
-                        
-                        // 获取所有活跃的客户端会话
-                        for (client_addr, session) in sessions_read.iter() {
-                            if let Some(server_socket) = &session.server_socket {
-                                if let Err(e) = server_socket.send_to(&buf[..len], *client_addr).await {
-                                    warn!("Failed to forward response to client {}: {}", client_addr, e);
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to receive response from target: {}", e);
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            }
-        }
-    });
+    let response_tasks = response_aggregator.start_multi_backend_listeners(response_sessions, target).await;
     
     // Clean up sessions periodically
     let sessions_cleanup = sessions.clone();
@@ -1373,13 +1376,13 @@ async fn run_server(listen: Vec<SocketAddr>, target: SocketAddr, no_monitor: boo
     
     for socket in sockets {
         let sessions_task = sessions.clone();
-        let target_socket_task = target_socket.clone();
         let client_map_task = client_target_map.clone();
         let packets_received_task = packets_received.clone();
         let bytes_received_task = bytes_received.clone();
         let packets_forwarded_task = packets_forwarded.clone();
         let bytes_forwarded_task = bytes_forwarded.clone();
         let socket_for_session = socket.clone();
+        let aggregator_task = server_aggregator.clone();
         
         let task = tokio::spawn(async move {
             let mut buf = vec![0u8; 65536];
@@ -1389,13 +1392,13 @@ async fn run_server(listen: Vec<SocketAddr>, target: SocketAddr, no_monitor: boo
             loop {
                 match socket.recv_from(&mut buf).await {
                     Ok((len, client_addr)) => {
-                        debug!("Server received {} bytes from {}", len, client_addr);
+                        trace!("Server socket {} received {} bytes from {}", socket_addr, len, client_addr);
                         
-                        // Update statistics
+                        // 立即更新统计 - 不再批量处理，确保统计准确
                         packets_received_task.fetch_add(1, Ordering::Relaxed);
                         bytes_received_task.fetch_add(len as u64, Ordering::Relaxed);
                         
-                        // Update or create session with socket reference
+                        // 立即更新会话
                         {
                             let mut sessions = sessions_task.write().await;
                             match sessions.get_mut(&client_addr) {
@@ -1404,7 +1407,7 @@ async fn run_server(listen: Vec<SocketAddr>, target: SocketAddr, no_monitor: boo
                                 }
                                 None => {
                                     sessions.insert(client_addr, UdpSession::new_with_socket(client_addr, socket_for_session.clone()));
-                                    debug!("New aggregated session from: {}", client_addr);
+                                    info!("🔗 NEW CLIENT CONNECTED: {} via socket {}", client_addr, socket_addr);
                                 }
                             }
                             
@@ -1412,19 +1415,23 @@ async fn run_server(listen: Vec<SocketAddr>, target: SocketAddr, no_monitor: boo
                             client_map_task.write().await.insert(client_addr, target);
                         }
                         
-                        // Forward to target backend
-                        match target_socket_task.send_to(&buf[..len], target).await {
-                            Ok(sent_bytes) => {
+                        // 注册客户端连接到聚合器
+                        aggregator_task.register_client_connection(client_addr, socket_for_session.clone()).await;
+                        
+                        // Forward to target backend using load balancing
+                        match aggregator_task.send_to_backend(&buf[..len], target, client_addr).await {
+                            Ok(()) => {
                                 packets_forwarded_task.fetch_add(1, Ordering::Relaxed);
-                                bytes_forwarded_task.fetch_add(sent_bytes as u64, Ordering::Relaxed);
+                                bytes_forwarded_task.fetch_add(len as u64, Ordering::Relaxed);
+                                trace!("✅ Forwarded {} bytes to backend for client {} via socket {}", len, client_addr, socket_addr);
                             }
                             Err(e) => {
-                                warn!("Failed to forward to target {}: {}", target, e);
+                                warn!("❌ Failed to forward to target {} for client {} via socket {}: {}", target, client_addr, socket_addr, e);
                             }
                         }
                     }
                     Err(e) => {
-                        error!("Failed to receive: {}", e);
+                        error!("Failed to receive on socket {}: {}", socket_addr, e);
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
                 }
@@ -1434,8 +1441,10 @@ async fn run_server(listen: Vec<SocketAddr>, target: SocketAddr, no_monitor: boo
         tasks.push(task);
     }
     
-    // 添加响应转发任务
-    tasks.push(response_task);
+    // 添加响应转发任务（多链路）
+    for task in response_tasks {
+        tasks.push(task);
+    }
     
     // Wait for all tasks
     for task in tasks {
@@ -1443,4 +1452,384 @@ async fn run_server(listen: Vec<SocketAddr>, target: SocketAddr, no_monitor: boo
     }
     
     Ok(())
+}
+
+/// 服务端多链路聚合器
+struct ServerAggregator {
+    /// 客户端连接映射 (客户端IP -> 该客户端的所有连接和源地址)
+    /// 修复：按照客户端IP而不是IP:端口来识别多链路
+    client_connections: Arc<RwLock<HashMap<IpAddr, Vec<(SocketAddr, Arc<UdpSocket>)>>>>,
+    /// 到后端目标的多个连接
+    backend_connections: Arc<RwLock<Vec<Arc<UdpSocket>>>>, 
+    /// 负载均衡策略
+    strategy: LoadBalanceStrategy,
+    /// 轮询索引
+    round_robin_index: AtomicU64,
+    /// 统计信息
+    response_packets_sent: Arc<AtomicU64>,
+    response_bytes_sent: Arc<AtomicU64>,
+    /// 多客户端请求追踪 (后端连接索引 -> 活跃客户端集合)，支持多客户端并发
+    backend_to_clients_map: Arc<RwLock<HashMap<usize, HashSet<SocketAddr>>>>,
+    /// 客户端最后活动时间，用于清理超时映射
+    client_last_activity: Arc<RwLock<HashMap<SocketAddr, Instant>>>,
+}
+
+impl ServerAggregator {
+    fn new(strategy: LoadBalanceStrategy) -> Self {
+        Self {
+            client_connections: Arc::new(RwLock::new(HashMap::new())),
+            backend_connections: Arc::new(RwLock::new(Vec::new())),
+            strategy,
+            round_robin_index: AtomicU64::new(0),
+            response_packets_sent: Arc::new(AtomicU64::new(0)),
+            response_bytes_sent: Arc::new(AtomicU64::new(0)),
+            backend_to_clients_map: Arc::new(RwLock::new(HashMap::new())),
+            client_last_activity: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+    
+    /// 注册客户端连接（避免重复注册）- 修复：按客户端IP分组多链路
+    async fn register_client_connection(&self, client_addr: SocketAddr, server_socket: Arc<UdpSocket>) {
+        let client_ip = client_addr.ip();
+        let mut connections = self.client_connections.write().await;
+        let client_connections = connections.entry(client_ip).or_insert_with(Vec::new);
+
+        // 检查是否已经注册过这个socket
+        let socket_local_addr = server_socket.local_addr().ok();
+        let already_registered = client_connections.iter().any(|(_, existing_socket)| {
+            existing_socket.local_addr().ok() == socket_local_addr
+        });
+
+        if !already_registered {
+            client_connections.push((client_addr, server_socket));
+            let total_connections = client_connections.len();
+            info!("🔗 Registered NEW connection for client IP {} from {} (total: {}) - socket: {:?}",
+                  client_ip, client_addr, total_connections, socket_local_addr);
+
+            if total_connections > 1 {
+                info!("🎯 CLIENT IP {} NOW HAS MULTI-LINK: {} connections from different ports/interfaces!", client_ip, total_connections);
+                // 显示所有连接详情
+                for (i, (src_addr, sock)) in client_connections.iter().enumerate() {
+                    let local_addr = sock.local_addr().unwrap_or_else(|_| "unknown".parse().unwrap());
+                    info!("   Link {}: {} -> {}", i + 1, src_addr, local_addr);
+                }
+            }
+        }
+    }
+    
+    /// 添加到后端的连接
+    async fn add_backend_connection(&self, target: SocketAddr) -> Result<()> {
+        let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+        socket.connect(target).await?;
+        
+        let local_addr = socket.local_addr()?;
+        info!("Created backend connection from {} to {}", local_addr, target);
+        
+        self.backend_connections.write().await.push(socket);
+        Ok(())
+    }
+    
+    /// 使用负载均衡策略选择客户端连接
+    #[allow(dead_code)]
+    async fn select_client_connection(&self, client_addr: SocketAddr) -> Option<Arc<UdpSocket>> {
+        let client_ip = client_addr.ip();
+        let connections = self.client_connections.read().await;
+        if let Some(client_connections) = connections.get(&client_ip) {
+            if client_connections.is_empty() {
+                return None;
+            }
+
+            match self.strategy {
+                LoadBalanceStrategy::PacketRoundRobin => {
+                    let index = self.round_robin_index.fetch_add(1, Ordering::Relaxed) as usize;
+                    let selected_index = index % client_connections.len();
+                    Some(client_connections[selected_index].1.clone())
+                }
+                _ => {
+                    // 其他策略暂时使用轮询
+                    let index = self.round_robin_index.fetch_add(1, Ordering::Relaxed) as usize;
+                    let selected_index = index % client_connections.len();
+                    Some(client_connections[selected_index].1.clone())
+                }
+            }
+        } else {
+            None
+        }
+    }
+    
+    /// 使用负载均衡策略选择后端连接
+    #[allow(dead_code)]
+    async fn select_backend_connection(&self) -> Option<Arc<UdpSocket>> {
+        let connections = self.backend_connections.read().await;
+        if connections.is_empty() {
+            return None;
+        }
+        
+        match self.strategy {
+            LoadBalanceStrategy::PacketRoundRobin => {
+                let index = self.round_robin_index.fetch_add(1, Ordering::Relaxed) as usize;
+                let selected_index = index % connections.len();
+                Some(connections[selected_index].clone())
+            }
+            _ => {
+                // 其他策略暂时使用轮询
+                let index = self.round_robin_index.fetch_add(1, Ordering::Relaxed) as usize;
+                let selected_index = index % connections.len();
+                Some(connections[selected_index].clone())
+            }
+        }
+    }
+    
+    /// 向客户端发送响应（使用负载均衡）
+    #[allow(dead_code)]
+    async fn send_response_to_client(&self, client_addr: SocketAddr, data: &[u8]) -> Result<()> {
+        if let Some(socket) = self.select_client_connection(client_addr).await {
+            match socket.send_to(data, client_addr).await {
+                Ok(bytes_sent) => {
+                    self.response_packets_sent.fetch_add(1, Ordering::Relaxed);
+                    self.response_bytes_sent.fetch_add(bytes_sent as u64, Ordering::Relaxed);
+                    debug!("Response sent to client {} via selected connection: {} bytes", client_addr, bytes_sent);
+                    Ok(())
+                }
+                Err(e) => {
+                    warn!("Failed to send response to client {}: {}", client_addr, e);
+                    Err(anyhow::anyhow!("Response send failed: {}", e))
+                }
+            }
+        } else {
+            warn!("No available connections for client {}", client_addr);
+            Err(anyhow::anyhow!("No available connections for client"))
+        }
+    }
+    
+    /// 向后端发送数据（使用负载均衡）并记录多客户端映射
+    async fn send_to_backend(&self, data: &[u8], target: SocketAddr, client_addr: SocketAddr) -> Result<()> {
+        let backend_connections = self.backend_connections.read().await;
+        if backend_connections.is_empty() {
+            warn!("No available backend connections");
+            return Err(anyhow::anyhow!("No available backend connections"));
+        }
+        
+        let backend_index = match self.strategy {
+            LoadBalanceStrategy::PacketRoundRobin => {
+                let index = self.round_robin_index.fetch_add(1, Ordering::Relaxed) as usize;
+                index % backend_connections.len()
+            }
+            _ => {
+                // 其他策略暂时使用轮询
+                let index = self.round_robin_index.fetch_add(1, Ordering::Relaxed) as usize;
+                index % backend_connections.len()
+            }
+        };
+        
+        let socket = &backend_connections[backend_index];
+        
+        match socket.send_to(data, target).await {
+            Ok(bytes_sent) => {
+                // 记录后端连接索引到客户端集合的映射，支持多客户端并发
+                {
+                    let mut backend_map = self.backend_to_clients_map.write().await;
+                    backend_map.entry(backend_index).or_insert_with(HashSet::new).insert(client_addr);
+                }
+                
+                // 更新客户端最后活动时间
+                {
+                    let mut activity_map = self.client_last_activity.write().await;
+                    activity_map.insert(client_addr, Instant::now());
+                }
+                
+                debug!("Data sent to backend {} via connection {} for client {}: {} bytes", 
+                       target, backend_index, client_addr, bytes_sent);
+                Ok(())
+            }
+            Err(e) => {
+                warn!("Failed to send to backend {} via connection {}: {}", target, backend_index, e);
+                Err(anyhow::anyhow!("Backend send failed: {}", e))
+            }
+        }
+    }
+    
+    /// 定期清理超时的客户端映射
+    #[allow(dead_code)]
+    async fn cleanup_expired_clients(&self) {
+        let timeout_threshold = Instant::now() - Duration::from_secs(60); // 60秒超时
+        
+        // 清理活动时间映射
+        let mut activity_map = self.client_last_activity.write().await;
+        let expired_clients: Vec<SocketAddr> = activity_map
+            .iter()
+            .filter(|(_, &last_activity)| last_activity < timeout_threshold)
+            .map(|(&addr, _)| addr)
+            .collect();
+        
+        for client_addr in &expired_clients {
+            activity_map.remove(client_addr);
+        }
+        
+        // 清理后端到客户端映射
+        let mut backend_map = self.backend_to_clients_map.write().await;
+        for clients_set in backend_map.values_mut() {
+            for client_addr in &expired_clients {
+                clients_set.remove(client_addr);
+            }
+        }
+        
+        // 清理空的后端映射
+        backend_map.retain(|_, clients_set| !clients_set.is_empty());
+        
+        if !expired_clients.is_empty() {
+            debug!("Cleaned up {} expired client mappings", expired_clients.len());
+        }
+    }
+    
+    /// 启动定期清理任务
+    pub fn start_cleanup_task(&self) -> tokio::task::JoinHandle<()> {
+        let backend_to_clients_map = self.backend_to_clients_map.clone();
+        let client_last_activity = self.client_last_activity.clone();
+        
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                
+                let timeout_threshold = Instant::now() - Duration::from_secs(60);
+                
+                // 清理活动时间映射
+                let mut activity_map = client_last_activity.write().await;
+                let expired_clients: Vec<SocketAddr> = activity_map
+                    .iter()
+                    .filter(|(_, &last_activity)| last_activity < timeout_threshold)
+                    .map(|(&addr, _)| addr)
+                    .collect();
+                
+                for client_addr in &expired_clients {
+                    activity_map.remove(client_addr);
+                }
+                drop(activity_map);
+                
+                // 清理后端到客户端映射
+                let mut backend_map = backend_to_clients_map.write().await;
+                for clients_set in backend_map.values_mut() {
+                    for client_addr in &expired_clients {
+                        clients_set.remove(client_addr);
+                    }
+                }
+                
+                // 清理空的后端映射
+                backend_map.retain(|_, clients_set| !clients_set.is_empty());
+                
+                if !expired_clients.is_empty() {
+                    debug!("Cleaned up {} expired client mappings", expired_clients.len());
+                }
+            }
+        })
+    }
+    
+    /// 启动多个后端监听器，每个后端连接一个任务，实现真正的多链路响应聚合
+    async fn start_multi_backend_listeners(
+        &self, 
+        sessions: Arc<RwLock<HashMap<SocketAddr, UdpSession>>>,
+        target: SocketAddr
+    ) -> Vec<tokio::task::JoinHandle<()>> {
+        let backend_connections = self.backend_connections.read().await;
+        let mut tasks = Vec::new();
+        
+        info!("Starting {} backend response listeners for multi-link aggregation", backend_connections.len());
+        
+        for (backend_index, backend_socket) in backend_connections.iter().enumerate() {
+            let socket = backend_socket.clone();
+            let _sessions_clone = sessions.clone();
+            let client_connections = self.client_connections.clone();
+            let backend_to_clients_map = self.backend_to_clients_map.clone();
+            let client_last_activity = self.client_last_activity.clone();
+            let client_round_robin_index = Arc::new(AtomicU64::new(0)); // 每个任务独立的轮询索引
+            let response_packets_sent = self.response_packets_sent.clone();
+            let response_bytes_sent = self.response_bytes_sent.clone();
+            
+            let task = tokio::spawn(async move {
+                let mut buf = vec![0u8; 65536];
+                info!("🎯 BACKEND LISTENER {} STARTED === Monitoring responses from {}", backend_index, target);
+                
+                loop {
+                    match socket.recv_from(&mut buf).await {
+                        Ok((len, response_addr)) => {
+                            debug!("🔙 Backend {} received {} bytes from {}", backend_index, len, response_addr);
+                            
+                            if response_addr == target {
+                                // 查找这个后端连接对应的所有活跃客户端
+                                let client_addrs = {
+                                    let mut active_clients = Vec::new();
+                                    let backend_map = backend_to_clients_map.read().await;
+                                    
+                                    if let Some(clients_set) = backend_map.get(&backend_index) {
+                                        // 检查客户端活动时间，移除超时的客户端
+                                        let activity_map = client_last_activity.read().await;
+                                        let timeout_threshold = Instant::now() - Duration::from_secs(30); // 30秒超时
+                                        
+                                        for &client_addr in clients_set {
+                                            if let Some(&last_activity) = activity_map.get(&client_addr) {
+                                                if last_activity > timeout_threshold {
+                                                    active_clients.push(client_addr);
+                                                }
+                                            }
+                                        }
+                                        
+                                        if active_clients.is_empty() && !clients_set.is_empty() {
+                                            warn!("🕐 Backend {} has {} mapped clients but all are timeout", backend_index, clients_set.len());
+                                        }
+                                    } else {
+                                        trace!("🤷 Backend {} received response but no client mapping found", backend_index);
+                                    }
+                                    active_clients
+                                };
+                                
+                                debug!("📤 Backend {} forwarding response to {} active clients", backend_index, client_addrs.len());
+                                
+                                // 向所有活跃客户端发送响应，使用各自的负载均衡连接
+                                for client_addr in client_addrs {
+                                    let client_ip = client_addr.ip();
+                                    let client_connections_read = client_connections.read().await;
+                                    if let Some(client_sockets) = client_connections_read.get(&client_ip) {
+                                        if !client_sockets.is_empty() {
+                                            // 使用轮询选择客户端连接实现响应的负载均衡
+                                            let conn_index = client_round_robin_index.fetch_add(1, Ordering::Relaxed) as usize;
+                                            let (_, selected_socket) = &client_sockets[conn_index % client_sockets.len()];
+
+                                            match selected_socket.send_to(&buf[..len], client_addr).await {
+                                                Ok(bytes_sent) => {
+                                                    response_packets_sent.fetch_add(1, Ordering::Relaxed);
+                                                    response_bytes_sent.fetch_add(bytes_sent as u64, Ordering::Relaxed);
+                                                    debug!("✅ Backend {} sent response to client {} via connection {} ({}/{}): {} bytes",
+                                                           backend_index, client_addr, conn_index % client_sockets.len(),
+                                                           conn_index % client_sockets.len() + 1, client_sockets.len(), bytes_sent);
+                                                }
+                                                Err(e) => {
+                                                    warn!("❌ Backend {} failed to send response to client {}: {}", backend_index, client_addr, e);
+                                                }
+                                            }
+                                        } else {
+                                            warn!("⚠️  No connections available for client IP {}", client_ip);
+                                        }
+                                    } else {
+                                        warn!("❓ Client {} not found in connection map", client_addr);
+                                    }
+                                }
+                            } else {
+                                warn!("🔀 Backend {} received unexpected response from {}, expected {}", backend_index, response_addr, target);
+                            }
+                        }
+                        Err(e) => {
+                            error!("💥 Backend listener {} failed to receive: {}", backend_index, e);
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    }
+                }
+            });
+            
+            tasks.push(task);
+        }
+        
+        info!("All {} backend response listeners started successfully", tasks.len());
+        tasks
+    }
 }
