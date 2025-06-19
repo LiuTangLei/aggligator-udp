@@ -78,9 +78,9 @@ impl Receiver {
     pub async fn recv(&mut self) -> Result<Option<Bytes>, RecvError> {
         match self.rx.recv().await {
             Some(data) => Ok(Some(data)),
-            None => match self.error_rx.borrow().clone() {
+            None => match self.error_rx.borrow().as_ref() {
                 None => Ok(None),
-                Some(err) => Err(err),
+                Some(err) => Err(err.clone()),
             },
         }
     }
@@ -90,9 +90,9 @@ impl Receiver {
     pub fn poll_recv(&mut self, cx: &mut Context) -> Poll<Result<Option<Bytes>, RecvError>> {
         match ready!(self.rx.poll_recv(cx)) {
             Some(data) => Poll::Ready(Ok(Some(data))),
-            None => match self.error_rx.borrow().clone() {
+            None => match self.error_rx.borrow().as_ref() {
                 None => Poll::Ready(Ok(None)),
-                Some(err) => Poll::Ready(Err(err)),
+                Some(err) => Poll::Ready(Err(err.clone())),
             },
         }
     }
