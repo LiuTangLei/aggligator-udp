@@ -27,6 +27,12 @@ use crate::{
     unordered_msg::UnorderedLinkMsg,
 };
 
+const MIN_EXPLORATION_WEIGHT: f64 = 0.2;  // 最小探索权重20%
+const HIGH_LOSS_THRESHOLD: f64 = 0.8;     // 高丢包率阈值80%
+const MIN_QUALITY_WEIGHT: f64 = 0.1;      // 高丢包时的最小质量权重
+const ABSOLUTE_MIN_WEIGHT: f64 = 0.05;    // 绝对最小权重5%
+const LOSS_RATE_TOLERANCE: f64 = 0.1;     // 丢包率容差10%
+
 /// Detailed error types for unordered aggregation operations
 #[derive(Debug)]
 pub enum UnorderedAggError {
@@ -917,64 +923,29 @@ impl UnorderedLoadBalancer {
                 Some(best_link)
             }
             LoadBalanceStrategy::WeightedByPacketLoss => {
-                // Weighted random selection using windowed packet loss rates and dynamic weights
-                // Links with lower packet loss get higher probability, with exploration mechanism
-                let mut weights = Vec::new();
-                let mut total_weight = 0.0;
+                let mut best_links = Vec::new();
+                let mut min_loss_rate = 1.0;
 
-                // Calculate dynamic weights for each link
                 for (link_id, link_state) in healthy_links.iter() {
-                    // Use windowed packet loss rate for more responsive adjustment
-                    let windowed_loss_rate = link_state.windowed_packet_loss_rate().await;
-
-                    // Get base bandwidth from metrics (with fallback)
-                    let metrics = self.link_metrics.read().await;
-                    let base_bandwidth = metrics
-                        .get(link_id)
-                        .map(|m| match self.node_role {
-                            crate::unordered_cfg::NodeRole::Client => m.recv_bandwidth,
-                            crate::unordered_cfg::NodeRole::Server => m.send_bandwidth,
-                            crate::unordered_cfg::NodeRole::Balanced => {
-                                (m.send_bandwidth + m.recv_bandwidth) / 2.0
-                            }
-                        })
-                        .unwrap_or(1.0);
-
-                    // Calculate dynamic weight with exploration mechanism
-                    let dynamic_weight = link_state.dynamic_weight(base_bandwidth).await;
-
-                    weights.push((**link_id, dynamic_weight, windowed_loss_rate));
-                    total_weight += dynamic_weight;
-
-                    debug!(
-                        "Link {} - windowed loss: {:.4}, base BW: {:.2}, dynamic weight: {:.4}",
-                        link_id, windowed_loss_rate, base_bandwidth, dynamic_weight
-                    );
-                }
-
-                if total_weight == 0.0 {
-                    // Fallback to first link if all weights are zero
-                    return Some(*healthy_links[0].0);
-                }
-
-                // Weighted random selection
-                use rand::Rng;
-                let mut rng = rand::rng();
-                let mut random_value = rng.random::<f64>() * total_weight;
-
-                for (link_id, weight, loss_rate) in &weights {
-                    random_value -= weight;
-                    if random_value <= 0.0 {
-                        debug!(
-                            "Selected link {} with dynamic weight {:.2}/{:.2} (windowed loss rate: {:.4})",
-                            link_id, weight, total_weight, loss_rate
-                        );
-                        return Some(*link_id);
+                    let mut windowed_stats = link_state.windowed_stats.write().await;
+                    let loss_rate = windowed_stats.windowed_packet_loss_rate();
+                    
+                    if loss_rate < min_loss_rate {
+                        min_loss_rate = loss_rate;
+                        best_links.clear();
+                        best_links.push(**link_id);
+                    } else if (loss_rate - min_loss_rate).abs() < LOSS_RATE_TOLERANCE {
+                        best_links.push(**link_id);
                     }
                 }
 
-                // Fallback to last link (shouldn't happen)
-                Some(weights.last().unwrap().0)
+                if best_links.is_empty() || min_loss_rate > 0.9 {
+                    let index = self.round_robin_index.fetch_add(1, Ordering::Relaxed) as usize;
+                    Some(*healthy_links[index % healthy_links.len()].0)
+                } else {
+                    let index = self.round_robin_index.fetch_add(1, Ordering::Relaxed) as usize;
+                    Some(best_links[index % best_links.len()])
+                }
             }
             LoadBalanceStrategy::DynamicAdaptive => {
                 // Advanced dynamic selection using windowed statistics and exploration
@@ -1063,7 +1034,7 @@ impl WindowedStats {
         Self {
             entries: VecDeque::new(),
             window_duration,
-            min_exploration_weight: 0.1, // 至少保留10%的权重用于探索
+            min_exploration_weight: 0.2, // 提高到20%的权重用于探索，确保更多链路参与
         }
     }
 
@@ -1126,14 +1097,16 @@ impl WindowedStats {
         let loss_rate = self.windowed_packet_loss_rate();
         let speed = self.windowed_send_speed();
 
-        // 基础权重：考虑带宽和丢包率
-        let quality_weight = (base_bandwidth + speed) * (1.0 - loss_rate).powi(2);
+        let quality_weight = if loss_rate < HIGH_LOSS_THRESHOLD {
+            (base_bandwidth + speed) * (1.0 - loss_rate).powi(2)
+        } else {
+            (base_bandwidth + speed) * MIN_QUALITY_WEIGHT
+        };
 
-        // 添加探索权重：确保即使表现不好的链路也能获得一些流量来尝试恢复
         let exploration_weight = base_bandwidth * self.min_exploration_weight;
 
-        // 总权重 = 质量权重 + 探索权重
-        quality_weight + exploration_weight
+        // 总权重 = 质量权重 + 探索权重，确保没有链路被完全排除
+        (quality_weight + exploration_weight).max(base_bandwidth * ABSOLUTE_MIN_WEIGHT)
     }
 
     /// 获取统计信息用于调试

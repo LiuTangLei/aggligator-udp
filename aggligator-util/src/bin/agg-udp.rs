@@ -28,6 +28,16 @@ use tracing::{debug, error, info, trace, warn};
 use aggligator::{unordered_cfg::LoadBalanceStrategy};
 use aggligator_util::init_log;
 
+const MIN_SUCCESS_RATE: f64 = 0.05;           // 最小成功率5%
+const BANDWIDTH_WINDOW_SECS: u64 = 15;        // 带宽计算窗口15秒
+const SUCCESS_RATE_ALPHA: f64 = 0.1;          // 成功率指数平滑系数
+const LOSS_RATE_ALPHA: f64 = 0.1;             // 丢包率指数平滑系数
+const MAX_RTT_PENALTY_MS: u64 = 500;          // 最大RTT惩罚500ms
+const SESSION_CLEANUP_INTERVAL_SECS: u64 = 30; // 会话清理间隔30秒
+const CONNECTION_TIMEOUT_SECS: u64 = 10;      // 连接超时10秒
+const LINK_INACTIVE_DEGRADATION: f64 = 0.95;  // 链路无活动时的降级系数
+
+
 /// Link performance statistics for simple UDP aggregation
 #[derive(Debug, Clone)]
 struct LinkStats {
@@ -77,9 +87,8 @@ impl LinkStats {
         self.bytes_sent += bytes as u64;
         self.window_bytes += bytes as u64;
 
-        // 使用5秒窗口减少频繁计算
         let window_duration = now.duration_since(self.window_start);
-        if window_duration >= Duration::from_secs(5) {
+        if window_duration >= Duration::from_secs(BANDWIDTH_WINDOW_SECS) {
             self.bandwidth_bps = (self.window_bytes as f64 / window_duration.as_secs_f64()) as u64;
             self.window_bytes = 0;
             self.window_start = now;
@@ -91,14 +100,14 @@ impl LinkStats {
     /// 记录发送成功，更新成功率
     fn record_send_success(&mut self) {
         // 使用指数平滑来更新成功率
-        self.success_rate = self.success_rate * 0.95 + 0.05;
+        self.success_rate = self.success_rate * (1.0 - SUCCESS_RATE_ALPHA) + SUCCESS_RATE_ALPHA;
         self.loss_rate = (1.0 - self.success_rate).max(0.0);
     }
     
     /// 记录发送失败，更新成功率
     fn record_send_failure(&mut self) {
-        self.success_rate = self.success_rate * 0.9; // 失败时衰减更快
-        self.loss_rate = (1.0 - self.success_rate).max(0.0);
+        self.success_rate = self.success_rate * (1.0 - SUCCESS_RATE_ALPHA);
+        self.loss_rate = self.loss_rate * (1.0 - LOSS_RATE_ALPHA) + LOSS_RATE_ALPHA;
         
         // 发送失败时给一个惩罚RTT
         self.avg_rtt = Some(Duration::from_millis(1000));
@@ -106,19 +115,20 @@ impl LinkStats {
     
     /// 更准确的RTT估算，基于真实网络测量
     fn estimate_rtt(&mut self) {
-        // 基于连接类型和健康度的简化RTT估算
-        let base_rtt = if self.success_rate > 0.95 {
-            Duration::from_millis(20)  // 优质连接：20ms基础延迟
-        } else if self.success_rate > 0.8 {
-            Duration::from_millis(40)  // 良好连接：40ms基础延迟
+        let base_rtt = if self.success_rate > 0.9 {
+            Duration::from_millis(15)  // 优质连接：15ms基础延迟
+        } else if self.success_rate > 0.7 {
+            Duration::from_millis(30)  // 良好连接：30ms基础延迟
+        } else if self.success_rate > 0.3 {
+            Duration::from_millis(60)  // 一般连接：60ms基础延迟
         } else {
-            Duration::from_millis(80)  // 较差连接：80ms基础延迟
+            Duration::from_millis(120) // 较差连接：120ms基础延迟
         };
         
-        // 根据丢包率增加延迟惩罚
-        let loss_penalty = Duration::from_millis((self.loss_rate * 200.0) as u64);
+        let loss_penalty = Duration::from_millis((self.loss_rate * MAX_RTT_PENALTY_MS as f64) as u64);
+        let bandwidth_factor = if self.bandwidth_bps > 1_000_000 { 0.8 } else { 1.2 }; // 高带宽链路通常延迟更低
         
-        self.avg_rtt = Some(base_rtt + loss_penalty);
+        self.avg_rtt = Some(Duration::from_millis(((base_rtt + loss_penalty).as_millis() as f64 * bandwidth_factor) as u64));
     }
 }
 
@@ -162,8 +172,7 @@ impl SimpleUdpAggregator {
 
     /// 判断是否为虚拟或不适用的接口
     fn is_virtual_interface(interface_name: &str) -> bool {
-        let virtual_prefixes = ["lo", "docker", "br-", "veth", "tun", "tap", "vmnet", "vboxnet"];
-        virtual_prefixes.iter().any(|prefix| interface_name.starts_with(prefix))
+        interface_name.starts_with("lo") || interface_name.starts_with("docker") || interface_name.starts_with("br-") || interface_name == "virbr0"
     }
 
     /// 判断接口是否适合用于聚合
@@ -211,9 +220,8 @@ impl SimpleUdpAggregator {
                 
                 info!("✅ Creating connection from {} to {}", interface.name, target);
                 
-                // Add timeout to prevent hanging on socket creation (increased from 2s to 5s)
                 match tokio::time::timeout(
-                    Duration::from_secs(5),
+                    Duration::from_secs(CONNECTION_TIMEOUT_SECS),
                     self.create_connection_for_interface(&interface, target)
                 ).await {
                     Ok(Ok(connection)) => {
@@ -341,7 +349,7 @@ impl SimpleUdpAggregator {
                         // 检查是否长时间无活动
                         if link_stat.last_update.elapsed() > Duration::from_secs(30) {
                             // 长时间无活动，轻微降低成功率
-                            link_stat.success_rate = (link_stat.success_rate * 0.98).max(0.1);
+                            link_stat.success_rate = (link_stat.success_rate * LINK_INACTIVE_DEGRADATION).max(MIN_SUCCESS_RATE);
                             link_stat.loss_rate = 1.0 - link_stat.success_rate;
                         }
                     }
@@ -527,10 +535,9 @@ impl SimpleUdpAggregator {
         // ★ NEW: 强绑设备，彻底避免主路由表把流量吸走
         #[cfg(target_os = "linux")]
         {
-            use std::os::unix::prelude::AsRawFd;
-            use socket2::{SockRef, Domain, Type, Protocol};
-            let sock_ref = unsafe { SockRef::from_raw_fd(socket.as_raw_fd()) };
-            sock_ref.set_bindtodevice(Some(&interface.name))?;
+            use socket2::SockRef;
+            let sock_ref = SockRef::from(&socket);
+            sock_ref.bind_device(Some(interface.name.as_bytes()))?;
         }
 
         // 可选：调用 socket.connect(target) 创建 NAT 映射，
@@ -700,8 +707,8 @@ impl SimpleUdpAggregator {
 
         for key in connections.keys() {
             if let Some(link_stats) = stats.get(key) {
-                // 大幅放宽健康度要求：20%成功率以上就可以使用（对应80%错误率以下）
-                if link_stats.success_rate > 0.2 {
+                // 大幅放宽健康度要求：5%成功率以上就可以使用（对应95%错误率以下）
+                if link_stats.success_rate > MIN_SUCCESS_RATE {
                     let rtt = link_stats.avg_rtt.unwrap_or(Duration::from_millis(50));
                     if rtt < best_rtt {
                         best_rtt = rtt;
@@ -732,8 +739,8 @@ impl SimpleUdpAggregator {
 
         for key in connections.keys() {
             if let Some(link_stats) = stats.get(key) {
-                // 大幅放宽要求：20%成功率以上就选择带宽最高的
-                if link_stats.success_rate > 0.2 && link_stats.bandwidth_bps > best_bandwidth {
+                // 大幅放宽要求：5%成功率以上就选择带宽最高的
+                if link_stats.success_rate > MIN_SUCCESS_RATE && link_stats.bandwidth_bps > best_bandwidth {
                     best_bandwidth = link_stats.bandwidth_bps;
                     best_key = key.clone();
                 } else if best_bandwidth == 0 {
@@ -1080,7 +1087,7 @@ async fn run_client(
         // Clean up sessions periodically
         let sessions_cleanup = sessions.clone();
         tokio::spawn(async move {
-            let mut interval = interval(Duration::from_secs(30));
+            let mut interval = interval(Duration::from_secs(SESSION_CLEANUP_INTERVAL_SECS));
             loop {
                 interval.tick().await;
                 let mut sessions = sessions_cleanup.write().await;
