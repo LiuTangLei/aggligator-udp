@@ -112,15 +112,21 @@ impl Sender {
             return Err(SendError::DataTooBig);
         }
 
-        self.tx.send(SendReq::Send(data)).await.map_err(|_| self.error_rx.borrow().clone())
+        self.tx.send(SendReq::Send(data)).await.map_err(|_| {
+            (*self.error_rx.borrow()).clone()
+        })
     }
 
     /// Flushes data queued for sending.
     #[inline]
     pub async fn flush(&self) -> Result<(), SendError> {
         let (flushed_tx, flushed_rx) = oneshot::channel();
-        self.tx.send(SendReq::Flush(flushed_tx)).await.map_err(|_| self.error_rx.borrow().clone())?;
-        flushed_rx.await.map_err(|_| self.error_rx.borrow().clone())?;
+        self.tx.send(SendReq::Flush(flushed_tx)).await.map_err(|_| {
+            (*self.error_rx.borrow()).clone()
+        })?;
+        flushed_rx.await.map_err(|_| {
+            (*self.error_rx.borrow()).clone()
+        })?;
         Ok(())
     }
 
@@ -192,7 +198,9 @@ impl Sink<Bytes> for SenderSink {
             return Poll::Ready(Err(SendError::Shutdown));
         }
 
-        this.tx.poll_ready_unpin(cx).map_err(|_| this.error_rx.borrow().clone())
+        this.tx.poll_ready_unpin(cx).map_err(|_| {
+            (*this.error_rx.borrow()).clone()
+        })
     }
 
     #[inline]
@@ -207,7 +215,9 @@ impl Sink<Bytes> for SenderSink {
             return Err(SendError::DataTooBig);
         }
 
-        this.tx.start_send_unpin(SendReq::Send(item)).map_err(|_| this.error_rx.borrow().clone())
+        this.tx.start_send_unpin(SendReq::Send(item)).map_err(|_| {
+            (*this.error_rx.borrow()).clone()
+        })
     }
 
     #[inline]
@@ -219,15 +229,21 @@ impl Sink<Bytes> for SenderSink {
         }
 
         if this.flushed_rx.is_none() {
-            ready!(this.tx.poll_ready_unpin(cx)).map_err(|_| this.error_rx.borrow().clone())?;
+            ready!(this.tx.poll_ready_unpin(cx)).map_err(|_| {
+                (*this.error_rx.borrow()).clone()
+            })?;
 
             let (flushed_tx, flushed_rx) = oneshot::channel();
-            this.tx.start_send_unpin(SendReq::Flush(flushed_tx)).map_err(|_| this.error_rx.borrow().clone())?;
+            this.tx.start_send_unpin(SendReq::Flush(flushed_tx)).map_err(|_| {
+                (*this.error_rx.borrow()).clone()
+            })?;
             this.flushed_rx = Some(flushed_rx);
         }
 
         let flushed_rx = this.flushed_rx.as_mut().unwrap();
-        ready!(flushed_rx.poll_unpin(cx)).map_err(|_| this.error_rx.borrow().clone())?;
+        ready!(flushed_rx.poll_unpin(cx)).map_err(|_| {
+            (*this.error_rx.borrow()).clone()
+        })?;
         this.flushed_rx = None;
 
         Poll::Ready(Ok(()))

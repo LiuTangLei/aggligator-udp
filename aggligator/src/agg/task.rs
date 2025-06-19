@@ -1469,7 +1469,7 @@ where
                     }
 
                     *status = SentReliableStatus::ResendQueued { msg: msg.clone() };
-                    self.resend_queue.push_back(p.clone());
+                    self.resend_queue.push_back(Arc::clone(p));
                 }
                 _ => (),
             };
