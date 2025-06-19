@@ -480,7 +480,9 @@ impl SimpleUdpAggregator {
 
     /// Create a UDP connection for a specific interface with connectivity test
     async fn create_connection_for_interface(
-        &self, interface: &NetworkInterface, target: SocketAddr,
+        &self,
+        interface: &NetworkInterface,
+        target: SocketAddr,
     ) -> Result<UdpConnection> {
         // Find a suitable local address on this interface
         let local_ip = interface.addr.iter()
@@ -522,10 +524,18 @@ impl SimpleUdpAggregator {
             }
         }
 
-        // 增加发送和接收缓冲区大小 (注释掉，需要系统级优化)
-        // TODO: 使用系统命令或socket选项来设置缓冲区大小
-        // warn!("Consider increasing system UDP buffer sizes: sysctl -w net.core.rmem_max=16777216");
-        // warn!("Consider increasing system UDP buffer sizes: sysctl -w net.core.wmem_max=16777216");
+        // ★ NEW: 强绑设备，彻底避免主路由表把流量吸走
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::prelude::AsRawFd;
+            use socket2::{SockRef, Domain, Type, Protocol};
+            let sock_ref = unsafe { SockRef::from_raw_fd(socket.as_raw_fd()) };
+            sock_ref.set_bindtodevice(Some(&interface.name))?;
+        }
+
+        // 可选：调用 socket.connect(target) 创建 NAT 映射，
+        // send_to() 时就不用每次带 target_addr 了
+        socket.connect(target).await?;
 
         Ok(UdpConnection {
             socket: Arc::new(socket),
