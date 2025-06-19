@@ -1034,7 +1034,7 @@ impl WindowedStats {
         Self {
             entries: VecDeque::new(),
             window_duration,
-            min_exploration_weight: 0.2, // 提高到20%的权重用于探索，确保更多链路参与
+            min_exploration_weight: MIN_EXPLORATION_WEIGHT, // 提高到20%的权重用于探索，确保更多链路参与
         }
     }
 
