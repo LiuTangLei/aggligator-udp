@@ -32,6 +32,7 @@ use aggligator::{
 };
 use aggligator_monitor::monitor::{interactive_monitor, watch_tags};
 use aggligator_transport_tcp::{IpVersion, TcpAcceptor, TcpConnector, TcpLinkFilter};
+use aggligator_transport_kcp::{KcpAcceptor, KcpConnector};
 use aggligator_util::{init_log, load_cfg, parse_tcp_link_filter, print_default_cfg};
 
 #[cfg(feature = "bluer")]
@@ -84,8 +85,6 @@ enum Commands {
     /// Tunnel server.
     Server(ServerCli),
     /// Shows the default configuration.
-    ShowCfg,
-    /// Generate manual pages for this tool in current directory.
     #[command(hide = true)]
     ManPages,
     /// Generate markdown page for this tool.
@@ -153,6 +152,11 @@ pub struct ClientCli {
     /// interface-ip: one link for each pair of local interface and remote IP address.
     #[arg(long, value_parser = parse_tcp_link_filter, default_value = "interface-interface")]
     tcp_link_filter: TcpLinkFilter,
+    /// KCP server IP addresses and port number.
+    ///
+    /// KCP provides reliable, low-latency communication over UDP.
+    #[arg(long)]
+    kcp: Vec<String>,
     /// Bluetooth RFCOMM server address.
     #[cfg(feature = "bluer")]
     #[arg(long)]
@@ -193,6 +197,38 @@ impl ClientCli {
                     eprintln!("cannot use TCP target: {err}");
                     None
                 }
+            }
+        } else {
+            None
+        };
+
+        let kcp_connector = if !self.kcp.is_empty() {
+            // Parse KCP addresses and create connector
+            let mut kcp_addrs = Vec::new();
+            for addr_str in &self.kcp {
+                match tokio::net::lookup_host(addr_str).await {
+                    Ok(addrs) => kcp_addrs.extend(addrs),
+                    Err(_) => {
+                        // Try resolving host with default port
+                        match tokio::net::lookup_host(format!("{addr_str}:{TCP_PORT}")).await {
+                            Ok(addrs) => kcp_addrs.extend(addrs),
+                            Err(err) => {
+                                eprintln!("invalid KCP address '{addr_str}': {err}");
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !kcp_addrs.is_empty() {
+                let kcp = KcpConnector::new(kcp_addrs.clone());
+                let kcp_targets: Vec<String> = kcp_addrs.iter().map(|a| format!("KCP {a}")).collect();
+                targets.extend(kcp_targets);
+                watch_conn.push(Box::new(kcp.clone()));
+                Some(kcp)
+            } else {
+                None
             }
         } else {
             None
@@ -288,6 +324,7 @@ impl ClientCli {
             let disabled_tags_rx = disabled_tags_rx.clone();
             let port_cfg = cfg.clone();
             let tcp_connector = tcp_connector.clone();
+            let kcp_connector = kcp_connector.clone();
             #[cfg(feature = "bluer")]
             let rfcomm_connector = rfcomm_connector.clone();
             #[cfg(feature = "usb-host")]
@@ -307,6 +344,9 @@ impl ClientCli {
 
                     let mut connector = builder.build();
                     if let Some(c) = tcp_connector.clone() {
+                        connector.add(c);
+                    }
+                    if let Some(c) = kcp_connector.clone() {
                         connector.add(c);
                     }
                     #[cfg(feature = "bluer")]
@@ -415,6 +455,11 @@ pub struct ServerCli {
     /// TCP port to listen on.
     #[arg(long)]
     tcp: Option<u16>,
+    /// KCP port to listen on.
+    ///
+    /// KCP provides reliable, low-latency communication over UDP.
+    #[arg(long)]
+    kcp: Option<u16>,
     /// RFCOMM channel number to listen on.
     #[cfg(feature = "bluer")]
     #[arg(long)]
@@ -468,6 +513,13 @@ impl ServerCli {
                 }
                 Err(err) => eprintln!("Cannot listen on TCP port {port}: {err}"),
             }
+        }
+
+        if let Some(port) = self.kcp {
+            let kcp_addr = SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port);
+            let kcp = KcpAcceptor::new([kcp_addr]);
+            server_ports.push(format!("KCP {kcp}"));
+            acceptor.add(kcp);
         }
 
         #[cfg(feature = "bluer")]

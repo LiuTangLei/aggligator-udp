@@ -2,7 +2,7 @@
 members = [
     "aggligator",
     "aggligator-monitor",
-    "aggligator-transport-bluer",
+    "aggligator-transport-bluer", "aggligator-transport-kcp",
     "aggligator-transport-tcp",
     "aggligator-transport-usb",
     "aggligator-transport-websocket",
