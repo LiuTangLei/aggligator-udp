@@ -1,0 +1,12 @@
+[package]
+name = "test_kcp_config"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.45", features = ["full"] }
+tokio_kcp = "=0.9.8"
+
+[[bin]]
+name = "test_kcp_config"
+path = "test_kcp_config.rs"

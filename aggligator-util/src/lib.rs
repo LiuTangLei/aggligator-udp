@@ -15,6 +15,9 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use aggligator::cfg::Cfg;
 use aggligator_transport_tcp::TcpLinkFilter;
 
+#[cfg(feature = "kcp")]
+use aggligator_transport_kcp::KcpLinkFilter;
+
 /// Initializes logging for command line utilities.
 pub fn init_log() {
     tracing_subscriber::registry().with(fmt::layer()).with(EnvFilter::from_default_env()).init();
@@ -45,5 +48,16 @@ pub fn parse_tcp_link_filter(s: &str) -> anyhow::Result<TcpLinkFilter> {
         "interface-interface" => Ok(TcpLinkFilter::InterfaceInterface),
         "interface-ip" => Ok(TcpLinkFilter::InterfaceIp),
         other => bail!("unknown TCP link filter: {other}"),
+    }
+}
+
+/// Parse [KcpLinkFilter] option.
+#[cfg(feature = "kcp")]
+pub fn parse_kcp_link_filter(s: &str) -> anyhow::Result<KcpLinkFilter> {
+    match s {
+        "none" => Ok(KcpLinkFilter::None),
+        "iface-ip" => Ok(KcpLinkFilter::InterfaceIp),
+        "iface-name" => Ok(KcpLinkFilter::InterfaceName),
+        other => bail!("unknown KCP link filter: {other}"),
     }
 }

@@ -3,3 +3,5 @@
 /aggligator-transport-webusb/target
 /TODO
 /*.dump
+.DS_Store
+.idea/
